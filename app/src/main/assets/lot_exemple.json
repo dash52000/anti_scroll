@@ -1,0 +1,98 @@
+{
+  "jour": "2026-11-19",
+  "portes": [
+    {
+      "id": "hopital",
+      "titre": "Comment l'hôpital est entré en crise",
+      "accroche": "Pourquoi manque-t-on de médecins dans un pays qui en formait plus de 8 500 par an au début des années 1970 ?",
+      "concepts": [
+        {
+          "id": "numerus-clausus",
+          "titre": "Le numerus clausus",
+          "theme": "Histoire & sociétés",
+          "question": "Et si la pénurie de médecins avait été organisée, volontairement, pour faire des économies ?",
+          "cartes": [
+            { "texte": "En 1971, la France crée le numerus clausus : un nombre maximal d'étudiants autorisés à poursuivre médecine après la première année." },
+            { "texte": "L'idée est comptable : moins de médecins, c'est moins de consultations et de prescriptions, donc moins de dépenses pour la Sécurité sociale." },
+            { "texte": "Le quota fond : plus de 8 500 places en 1972, environ 3 500 au début des années 1990. Il remonte ensuite, mais lentement." },
+            { "texte": "Une loi de 2019 le supprime. Mais il faut une dizaine d'années pour former un médecin : les choix des années 1990 pèsent encore aujourd'hui." }
+          ],
+          "aRetenir": "Pour freiner les dépenses, on a limité le nombre de médecins formés ; on en paie le prix des décennies plus tard.",
+          "aRaconter": "Tu savais que la pénurie de médecins a été en partie décidée ? Pendant près de 50 ans, un quota a limité le nombre d'étudiants en médecine, pour réduire les dépenses de santé.",
+          "ordreDeGrandeur": "Environ 8 500 places en 1972, environ 3 500 au début des années 1990.",
+          "source": { "titre": "Numerus clausus, Wikipédia", "url": "https://fr.wikipedia.org/wiki/Numerus_clausus" },
+          "qcm": {
+            "question": "Quel était l'objectif principal du numerus clausus en médecine ?",
+            "choix": ["Réduire les dépenses de santé", "Améliorer le niveau des études", "Mieux répartir les médecins sur le territoire"],
+            "bonne": 0,
+            "autreAngle": "Le quota visait surtout la Sécu : moins de médecins formés, pensait-on, c'est moins de soins prescrits, donc moins de dépenses."
+          }
+        }
+      ]
+    },
+    {
+      "id": "faits",
+      "titre": "Pourquoi les faits convainquent si peu",
+      "accroche": "Tu as les chiffres, les sources, la logique… et ton interlocuteur ne bouge pas d'un pouce. Pourquoi ?",
+      "mystere": true,
+      "indice": "Une étude sur une crème pour la peau… qui en dit long sur la politique.",
+      "concepts": [
+        {
+          "id": "raisonnement-motive",
+          "titre": "Le raisonnement motivé",
+          "theme": "Philo & idées",
+          "question": "Et si être bon en maths rendait parfois… moins lucide ?",
+          "cartes": [
+            { "texte": "En 2013, le chercheur américain Dan Kahan soumet à plus de 1 000 personnes un petit problème de statistiques : des données sur l'efficacité d'une crème pour la peau." },
+            { "texte": "Les plus forts en calcul trouvent la bonne réponse. D'autres participants reçoivent exactement les mêmes chiffres, mais à propos du contrôle des armes à feu." },
+            { "texte": "Là, les forts en calcul se trompent davantage, quand la bonne réponse contredit leur camp politique. Leur talent sert à défendre leur position, pas à trouver le vrai." },
+            { "texte": "C'est le raisonnement motivé : on raisonne en avocat, pas en juge. Ce qui marche mieux : partir des valeurs de l'autre, écouter son vécu, raconter une histoire." }
+          ],
+          "aRetenir": "On raisonne en avocat plutôt qu'en juge : les faits seuls bougent rarement une conviction.",
+          "aRaconter": "Une étude a montré que les gens les plus doués en calcul se trompent sur un problème simple… quand le bon résultat va contre leurs opinions politiques.",
+          "ordreDeGrandeur": "Plus de 1 000 Américains testés dans l'étude de Kahan.",
+          "source": { "titre": "Motivated reasoning, Wikipedia", "url": "https://en.wikipedia.org/wiki/Motivated_reasoning" },
+          "qcm": {
+            "question": "Dans l'étude de Kahan, qui se trompait le plus sur le calcul politisé ?",
+            "choix": ["Les forts en calcul dont le camp était contredit", "Les plus faibles en calcul", "Personne : les résultats étaient identiques"],
+            "bonne": 0,
+            "autreAngle": "Le talent en calcul n'a pas protégé de l'erreur : il a servi à défendre son camp. Plus on est habile, plus on trouve d'arguments pour ce qu'on pense déjà."
+          }
+        }
+      ]
+    },
+    {
+      "id": "capitalisme",
+      "titre": "Pourquoi on imagine plus facilement la fin du monde que celle du capitalisme",
+      "accroche": "Une phrase a fait le tour du monde : il serait plus facile d'imaginer la fin du monde que la fin du capitalisme. D'où vient ce blocage ?",
+      "concepts": [
+        {
+          "id": "hegemonie-culturelle",
+          "titre": "L'hégémonie culturelle",
+          "theme": "Philo & idées",
+          "question": "Comment un système tient-il debout, s'il ne repose pas seulement sur la force ?",
+          "cartes": [
+            { "texte": "1929, prison de Turi, en Italie. Antonio Gramsci, dirigeant communiste emprisonné par le régime de Mussolini, commence à remplir des cahiers d'écolier." },
+            { "texte": "Sa question : pourquoi la révolution a-t-elle eu lieu en Russie, mais pas dans l'Europe de l'Ouest industrialisée ?" },
+            { "texte": "Sa réponse : à l'Ouest, le pouvoir ne tient pas que par la police. Il tient par le consentement : l'école, la presse, l'Église diffusent une vision du monde qui devient le « bon sens »." },
+            { "texte": "En 2009, le Britannique Mark Fisher appelle « réalisme capitaliste » le stade ultime de cette hégémonie : le sentiment qu'aucune alternative n'est même imaginable." }
+          ],
+          "aRetenir": "Un pouvoir solide ne se contente pas de contraindre : il rend son ordre évident.",
+          "aRaconter": "Gramsci, en prison sous Mussolini, a compris que le capitalisme tient moins par la force que par le « bon sens » qu'il installe dans nos têtes.",
+          "ordreDeGrandeur": "33 cahiers, près de 3 000 pages écrites en prison.",
+          "source": { "titre": "Hégémonie culturelle, Wikipédia", "url": "https://fr.wikipedia.org/wiki/H%C3%A9g%C3%A9monie_culturelle" },
+          "qcm": {
+            "question": "Selon Gramsci, sur quoi repose surtout le pouvoir dans les pays d'Europe de l'Ouest ?",
+            "choix": ["Le consentement et le « bon sens » partagé", "La force armée", "La richesse des dirigeants"],
+            "bonne": 0,
+            "autreAngle": "Pour Gramsci, la police ne suffit pas : ce qui fait tenir un système, c'est qu'il paraisse naturel. L'école, les médias et la culture fabriquent ce consentement."
+          }
+        }
+      ]
+    }
+  ],
+  "pepite": {
+    "texte": "Un petit cumulus de beau temps pèse environ 500 tonnes : c'est le poids de l'eau qu'il contient, en gouttelettes si fines qu'elles restent portées par l'air qui monte."
+  },
+  "teaserDemain": "Demain, une porte t'attend : pourquoi la Chine et les États-Unis n'ont pas droit au même récit dans nos médias ?"
+}
