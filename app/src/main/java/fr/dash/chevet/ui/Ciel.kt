@@ -64,7 +64,7 @@ private fun DrawScope.colline(base: Float, amplitude: Float, decalage: Int, coul
         var i = decalage
         while (x < largeur) {
             val sommet = if (i % 2 == 0) amplitude else amplitude * 0.45f
-            quadraticBezierTo(x + pas / 2f, hauteur * (base - sommet), x + pas, hauteur * base)
+            quadraticTo(x + pas / 2f, hauteur * (base - sommet), x + pas, hauteur * base)
             x += pas
             i += 1
         }
