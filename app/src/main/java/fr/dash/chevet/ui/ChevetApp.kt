@@ -526,27 +526,31 @@ private fun PageCarte(page: Page, estDerniere: Boolean, onFin: () -> Unit, onSou
                 }
 
                 is Page.ARetenir -> {
-                    Etiquette("À retenir")
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        c.aRetenir,
-                        color = Encre,
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    c.ordreDeGrandeur?.let { chiffre ->
+                    if (c.aRetenir.isNotBlank()) {
+                        Etiquette("À retenir")
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            c.aRetenir,
+                            color = Encre,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    c.ordreDeGrandeur?.takeIf { it.isNotBlank() }?.let { chiffre ->
                         Spacer(Modifier.height(12.dp))
                         Text(chiffre, color = Ambre, style = MaterialTheme.typography.bodyLarge)
                     }
-                    Spacer(Modifier.height(16.dp))
-                    Etiquette("À raconter")
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        c.aRaconter,
-                        color = EncreDouce,
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontStyle = FontStyle.Italic,
-                    )
+                    if (c.aRaconter.isNotBlank()) {
+                        Spacer(Modifier.height(16.dp))
+                        Etiquette("À raconter")
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            c.aRaconter,
+                            color = EncreDouce,
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontStyle = FontStyle.Italic,
+                        )
+                    }
                 }
             }
             Spacer(Modifier.height(16.dp))
@@ -675,7 +679,7 @@ private fun EcranRecap(
         Spacer(Modifier.height(32.dp))
         Etiquette("Ce soir, tu as appris")
         Spacer(Modifier.height(12.dp))
-        concepts.forEach { c ->
+        concepts.filter { it.aRetenir.isNotBlank() }.forEach { c ->
             Text(
                 "• ${c.aRetenir}",
                 color = Encre,

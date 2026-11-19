@@ -19,6 +19,7 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MODELE_REDACTION = "openai/gpt-oss-120b";
 const MODELE_RELECTURE = "openai/gpt-oss-20b";
+const MODELE_VERIFICATION = "openai/gpt-oss-120b";
 const UA = "Chevet/0.1 (https://github.com/dash52000/anti_scroll)";
 const NB_ETAPES = 8;
 
@@ -75,7 +76,13 @@ function melanger<T>(tableau: T[]): T[] {
   return copie;
 }
 
-async function groq(modele: string, systeme: string, utilisateur: string, maxTokens = 3000): Promise<Json> {
+async function groq(
+  modele: string,
+  systeme: string,
+  utilisateur: string,
+  maxTokens = 3000,
+  temperature = 0.7,
+): Promise<Json> {
   const cle = Deno.env.get("CHEVET_GROQ_API_KEY");
   if (!cle) throw new Error("Secret CHEVET_GROQ_API_KEY absent");
   const r = await fetch(GROQ_URL, {
@@ -87,7 +94,7 @@ async function groq(modele: string, systeme: string, utilisateur: string, maxTok
         { role: "system", content: systeme },
         { role: "user", content: utilisateur },
       ],
-      temperature: 0.7,
+      temperature,
       max_completion_tokens: maxTokens,
       reasoning_effort: "low",
       response_format: { type: "json_object" },
@@ -425,7 +432,7 @@ Règles :
 - Le premier concept accroche la porte ; chaque concept suivant s'enchaîne avec le précédent.
 - "aRetenir" : une phrase à retenir, 25 mots au plus.
 - "aRaconter" : la version à placer dans une conversation, 35 mots au plus.
-- "ordreDeGrandeur" : une phrase courte qui donne un chiffre de l'article et ce qu'il mesure (ex. « 33 cahiers, près de 3 000 pages écrites en prison ») ; jamais un nombre ou une date seuls ; null si l'article n'a aucun chiffre parlant.
+- "ordreDeGrandeur" : une phrase courte qui donne un chiffre de l'article, en lien direct avec la porte, et ce qu'il mesure (ex. « 33 cahiers, près de 3 000 pages écrites en prison ») ; jamais un nombre ou une date seuls ; null si l'article n'a aucun chiffre parlant.
 - Varie les débuts de carte : au plus une carte par concept commence par une date.
 - Pas de lien de cause à effet que l'article n'établit pas lui-même.
 - "qcm" : une question de révision, 3 choix, la bonne en premier, et "autreAngle" qui réexplique autrement en 30 mots.
@@ -443,35 +450,90 @@ Format JSON :
 {"concepts":[{"titre":"...","question":"...","cartes":["...","..."],"aRetenir":"...","aRaconter":"...","ordreDeGrandeur":"..." ou null,
 "qcm":{"question":"...","choix":["bonne","fausse","fausse"],"autreAngle":"..."},"creuser":["...","...","..."]}]}`;
 
-  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 3200);
+  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 3200, 0.5);
   porte.redaction = resultat.concepts ?? [];
 }
 
 // ------------------------------------------------------------------ Étapes 4-6 : relecture factuelle
 
+function normaliser(texte: string): string {
+  return texte
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/** Vrai si la citation vient bien de l'article (à la ponctuation près). */
+function estProuve(preuve: string | undefined, source: string): boolean {
+  if (!preuve) return false;
+  const p = normaliser(preuve);
+  const s = normaliser(source);
+  if (p.length >= 25 && s.includes(p.slice(0, 120))) return true;
+  const mots = p.split(" ").filter((m) => m.length > 3);
+  if (mots.length < 5) return false;
+  return mots.filter((m) => s.includes(m)).length / mots.length >= 0.85;
+}
+
 async function relire(travail: Json, i: number) {
   const porte = travail.portes?.[i];
   if (!porte?.redaction?.length) return;
+  const valides = porte.redaction
+    .map((r: Json, k: number) => ({ r, k }))
+    .filter(({ r }: Json) => r && !r.horsSujet);
+  if (valides.length === 0) return;
 
-  const consigne = `Tu es relecteur factuel. Pour chaque concept, compare chaque carte, "aRetenir", "aRaconter",
-"ordreDeGrandeur" et le QCM à l'article source. Corrige toute affirmation absente de l'article ou déformée,
-ou supprime la carte si elle ne peut pas être sauvée (garde au moins 2 cartes). Supprime ou réécris toute scène, personnage,
-dialogue ou exemple qui n'est pas dans l'article : c'est la faute la plus grave. Ne change pas le style ni la structure.
+  const consigne = `Tu es relecteur factuel. Pour chaque concept, compare le texte à son article source.
+Pour chaque carte, recopie mot pour mot dans "preuve" la phrase de l'article qui la prouve.
+Si aucune phrase ne la prouve, réécris la carte pour qu'elle dise exactement ce que dit une phrase de l'article, ou supprime-la.
+Sois intraitable sur :
+- le sens exact (une négation inversée, « avec » au lieu de « sans », est une erreur grave) ;
+- les liens de cause à effet que l'article n'établit pas ;
+- les scènes, personnages ou exemples inventés ;
+- le rôle exact des institutions et des personnes.
+"ordreDeGrandeur" : garde-le seulement s'il vient de l'article et concerne la porte « ${porte.titre} », avec sa preuve ; sinon null.
+"aRetenir" et "aRaconter" : retire toute affirmation que les cartes prouvées ne soutiennent pas.
+Ne change pas le style.
 
-Articles sources :
-${porte.concepts.map((c: Json, k: number) => `### Concept ${k + 1} : ${c.titre}\n${c.extrait}`).join("\n\n")}
-
+${valides.map(({ r, k }: Json) => `### Concept ${k + 1} : ${r.titre}
+Article source :
+${porte.concepts[k]?.extrait ?? ""}
 Texte à relire :
-${JSON.stringify({ concepts: porte.redaction })}
+${JSON.stringify(r)}`).join("\n\n")}
 
-Réponds avec le même JSON corrigé, plus un champ "corrections" listant brièvement ce que tu as changé :
-{"concepts":[...],"corrections":["..."]}`;
+Réponds dans le même ordre, un objet par concept relu :
+{"concepts":[{"titre":"...","question":"...","cartes":[{"texte":"...","preuve":"citation exacte"}],"aRetenir":"...","aRaconter":"...",
+"ordreDeGrandeur":{"texte":"...","preuve":"citation exacte"} ou null,
+"qcm":{"question":"...","choix":["bonne","fausse","fausse"],"autreAngle":"..."},"creuser":["...","...","..."]}],
+"corrections":["..."]}`;
 
-  const resultat = await groq(MODELE_RELECTURE, SYSTEME_CHEVET, consigne, 3200);
-  if (Array.isArray(resultat.concepts) && resultat.concepts.length === porte.redaction.length) {
-    porte.redaction = resultat.concepts;
+  const resultat = await groq(MODELE_VERIFICATION, SYSTEME_CHEVET, consigne, 3400, 0.2);
+  const relus: Json[] = Array.isArray(resultat.concepts) ? resultat.concepts : [];
+  if (relus.length !== valides.length) {
+    porte.corrections = ["Relecture inutilisable : texte d'origine conservé."];
+    return;
   }
-  porte.corrections = resultat.corrections ?? [];
+
+  let retirees = 0;
+  valides.forEach(({ r: original, k }: Json, n: number) => {
+    const relu = relus[n];
+    const source: string = porte.concepts[k]?.extrait ?? "";
+    const cartes = (relu.cartes ?? []).filter((c: Json) => {
+      const ok = typeof c === "object" && c.texte && estProuve(c.preuve, source);
+      if (!ok) retirees++;
+      return ok;
+    }).map((c: Json) => c.texte);
+    const odg = relu.ordreDeGrandeur;
+    // La relecture ne touche qu'aux cartes, aux synthèses et au chiffre ; le reste vient de la rédaction.
+    porte.redaction[k] = cartes.length < 2 ? { titre: original.titre, horsSujet: true } : {
+      ...original,
+      cartes,
+      aRetenir: relu.aRetenir || cartes.at(-1),
+      aRaconter: relu.aRaconter || relu.aRetenir || cartes[0],
+      ordreDeGrandeur: odg && typeof odg === "object" && estProuve(odg.preuve, source) ? odg.texte : null,
+    };
+  });
+  porte.corrections = [...(resultat.corrections ?? []), `${retirees} carte(s) sans preuve retirée(s)`];
 }
 
 // ------------------------------------------------------------------ Étape 7 : pépite et assemblage
@@ -486,6 +548,7 @@ comme une pépite qu'on a envie de raconter. Uniquement un fait présent dans le
 ${extraits.join("\n\n")}
 Format JSON : {"texte":"..."}`,
     700,
+    0.4,
   );
 
   const portes = (travail.portes ?? [])
