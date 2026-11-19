@@ -99,7 +99,11 @@ fun Racine(
         partageEntrant = partageEntrant,
         onConceptsExplores = { concepts ->
             if (!pret.exemple) {
-                portee.launch { distant.enregistrerConcepts(concepts, pret.lot.jour, coeurs.conceptsAimes()) }
+                portee.launch {
+                    distant.enregistrerConcepts(concepts, pret.lot.jour)
+                    // Les cœurs posés pendant la lecture rejoignent le terrier côté serveur.
+                    concepts.filter { coeurs.conceptAime(it.id) }.forEach { distant.majConcept(it, pret.lot.jour, aime = true) }
+                }
             }
         },
     )

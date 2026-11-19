@@ -616,7 +616,7 @@ class Distant(context: Context) {
     // ------------------------------------------------------------ Terrier et journal
 
     /** Les concepts explorés ce soir rejoignent le terrier côté serveur (pour les tunnels de demain). */
-    suspend fun enregistrerConcepts(concepts: List<Concept>, jour: String, aimes: Set<String> = emptySet()) = withContext(Dispatchers.IO) {
+    suspend fun enregistrerConcepts(concepts: List<Concept>, jour: String) = withContext(Dispatchers.IO) {
         runCatching {
             val jeton = jeton()
             val uid = utilisateur() ?: return@runCatching
@@ -632,7 +632,6 @@ class Distant(context: Context) {
                         put("a_raconter", c.aRaconter)
                         put("qcm", json.encodeToJsonElement(fr.dash.chevet.model.Qcm.serializer(), c.qcm))
                         put("lot_jour", jour)
-                        put("aime", c.id in aimes)
                     })
                 }
             }
