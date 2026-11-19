@@ -29,7 +29,14 @@ donc une nouvelle version s'installe par-dessus l'ancienne sans désinstaller.
 | Journal d'utilisation | Local puis envoyé dans `chevet_journal` |
 | Terrier | Concepts explorés envoyés dans `chevet_concepts` |
 | Répétition espacée des QCM | Locale |
-| Onboarding, carnet, graphe du terrier | À faire |
+| Menu à un tap (icône maison ou geste retour) : arbre, « Ce soir », Relire, Faire | Fait |
+| Terrier : arbre qui pousse (saisons, fruits, feuilles du soir) et graphe en toile libre | Fait |
+| Cœur sur chaque carte, coups de cœur, carnet, soirées passées, recherche, stats | Fait (local) |
+| Autre porte : les restantes ou 3 portes neuves (action `bonus`), 3 par soir au plus | Fait |
+| Voisins d'un concept et « prolonger demain » (action `voisins`, colonnes `prolonger`) | Fait |
+| Longueur des cartes réglable, ajustée après 3 « trop dense » en 7 jours | Fait |
+| Boîte à curiosités : saisie et menu de partage Android | Fait |
+| Onboarding, check-in du dimanche | À faire |
 
 Reporté en V2 : banque d'images de paysages, météo, version courte automatique, photo
 dans la boîte à curiosités.
@@ -37,7 +44,7 @@ dans la boîte à curiosités.
 ## Côté serveur
 
 Chevet est hébergé dans le projet Supabase **Panier** : tables préfixées `chevet_`,
-fonctions `chevet-lot` et `chevet-creuser`. La clé Groq est un secret de fonction
+fonctions `chevet-lot` (lot du jour, réglages, autres portes, voisins) et `chevet-creuser`. La clé Groq est un secret de fonction
 (`CHEVET_GROQ_API_KEY`), jamais dans l'APK. Le profil du lecteur vit dans la table
 `chevet_profil`, pas dans ce dépôt.
 
