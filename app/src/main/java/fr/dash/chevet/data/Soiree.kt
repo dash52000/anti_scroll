@@ -37,6 +37,24 @@ class Soiree(context: Context) {
         get() = prefs.getBoolean("outils_test", false)
         set(v) = prefs.edit().putBoolean("outils_test", v).apply()
 
+    // ------------------------------------------------------------ « Trop dense »
+
+    /** Note un « trop dense » et renvoie le nombre de ceux des 7 derniers jours. */
+    fun noterTropDense(maintenant: LocalDateTime = LocalDateTime.now()): Int {
+        val limite = maintenant.minusDays(7)
+        val recents = (prefs.getString("trop_dense", null) ?: "")
+            .split(';')
+            .mapNotNull { runCatching { LocalDateTime.parse(it) }.getOrNull() }
+            .filter { it.isAfter(limite) } + maintenant
+        prefs.edit().putString("trop_dense", recents.joinToString(";")).apply()
+        return recents.size
+    }
+
+    /** Après un ajustement de la longueur, le compteur repart de zéro. */
+    fun oublierTropDense() {
+        prefs.edit().remove("trop_dense").apply()
+    }
+
     // ------------------------------------------------------------ Heure de coucher
 
     /**

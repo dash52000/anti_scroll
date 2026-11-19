@@ -58,6 +58,34 @@ data class ResultatFlux(
     val erreur: String? = null,
 )
 
+/** Une porte bonus proposée par « d'autres portes », pas encore écrite. */
+@Serializable
+data class PorteProposee(
+    val id: String,
+    val titre: String,
+    val accroche: String = "",
+    val mystere: Boolean = false,
+    val indice: String? = null,
+)
+
+/** Un voisin d'un concept dans le terrier : un article lié, pas encore exploré. */
+@Serializable
+data class Voisin(
+    val titre: String,
+    val accroche: String = "",
+    val url: String = "",
+)
+
+/** Une entrée de la boîte à curiosités. */
+@Serializable
+data class Curiosite(
+    val id: String = "",
+    val texte: String? = null,
+    val url: String? = null,
+    val statut: String = "en_attente",
+    @kotlinx.serialization.SerialName("cree_le") val creeLe: String = "",
+)
+
 private const val FONCTION_LOT = "/functions/v1/chevet-lot"
 
 class Distant(context: Context) {
@@ -302,6 +330,181 @@ class Distant(context: Context) {
         val lot = lotEnCache(jour) ?: return
         val nouveau = lot.copy(portes = lot.portes.map { if (it.id == porte.id) porte else it })
         cache(jour).writeText(json.encodeToString(Lot.serializer(), nouveau))
+    }
+
+    private fun ajouterPorteEnCache(porte: Porte) {
+        val jour = LocalDate.now()
+        val lot = lotEnCache(jour) ?: return
+        if (lot.portes.any { it.id == porte.id }) return
+        cache(jour).writeText(json.encodeToString(Lot.serializer(), lot.copy(portes = lot.portes + porte)))
+    }
+
+    // ------------------------------------------------------------ D'autres portes (menu)
+
+    /** Un appel « bonus » ; [porteId] null pour composer, sinon pour écrire la porte choisie. */
+    private fun appelBonus(demande: String, porteId: String?): JsonObject? {
+        val corps = buildJsonObject {
+            put("action", "bonus")
+            put("demande", demande)
+            if (porteId != null) put("porte", porteId)
+        }.toString()
+        val (_, texte) = requete("POST", FONCTION_LOT, corps, jeton())
+        return objet(texte)
+    }
+
+    /** Compose 3 portes neuves pour ce soir ; null si le serveur n'y arrive pas. */
+    suspend fun composerBonus(demande: String): List<PorteProposee>? = withContext(Dispatchers.IO) {
+        try {
+            val debut = System.currentTimeMillis()
+            while (System.currentTimeMillis() - debut < 4 * 60_000L) {
+                val o = appelBonus(demande, null) ?: return@withContext null
+                when (o["statut"]?.jsonPrimitive?.contentOrNull) {
+                    "choix" -> {
+                        val brut = o["portes"] ?: return@withContext null
+                        return@withContext json.decodeFromJsonElement(
+                            kotlinx.serialization.builtins.ListSerializer(PorteProposee.serializer()),
+                            brut,
+                        )
+                    }
+                    "en_cours" -> delay(if (o["occupe"] != null) 5_000 else 15_000)
+                    else -> return@withContext null
+                }
+            }
+            null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Écrit la porte bonus choisie, l'ajoute au lot en cache et la renvoie ; null en cas d'échec. */
+    suspend fun ecrireBonus(demande: String, porteId: String, onEtape: (Preparation) -> Unit): Porte? =
+        withContext(Dispatchers.IO) {
+            try {
+                val debut = System.currentTimeMillis()
+                while (System.currentTimeMillis() - debut < 6 * 60_000L) {
+                    val o = appelBonus(demande, porteId) ?: return@withContext null
+                    val etape = o["etape"]?.jsonPrimitive?.intOrNull ?: 0
+                    val total = o["total"]?.jsonPrimitive?.intOrNull ?: 3
+                    withContext(Dispatchers.Main) { onEtape(Preparation(etape, total)) }
+                    when (o["statut"]?.jsonPrimitive?.contentOrNull) {
+                        "pret" -> {
+                            val brut = o["porte"] ?: return@withContext null
+                            val porte = json.decodeFromJsonElement(Porte.serializer(), brut)
+                            ajouterPorteEnCache(porte)
+                            return@withContext porte
+                        }
+                        "en_cours" -> {
+                            val souffle = o["occupe"] != null || o["erreur"]?.jsonPrimitive?.contentOrNull != null
+                            if (souffle) delay(10_000)
+                        }
+                        else -> return@withContext null
+                    }
+                }
+                null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+    // ------------------------------------------------------------ Terrier (menu)
+
+    /** Les voisins d'un concept, choisis par l'IA ; null hors connexion. */
+    suspend fun voisins(vu: ConceptVu): List<Voisin>? = withContext(Dispatchers.IO) {
+        try {
+            val corps = buildJsonObject {
+                put("action", "voisins")
+                put("url", vu.concept.source.url)
+                put("titre", vu.concept.titre)
+                put("slug", vu.concept.id)
+            }.toString()
+            val (code, texte) = requete("POST", FONCTION_LOT, corps, jeton())
+            val brut = objet(texte)?.get("voisins")
+            if (code !in 200..299 || brut == null) return@withContext null
+            json.decodeFromJsonElement(kotlinx.serialization.builtins.ListSerializer(Voisin.serializer()), brut)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Met à jour un concept du terrier côté serveur (cœur, « prolonger demain »), en le créant
+     * s'il n'y est pas encore : le lot de demain en tient compte.
+     */
+    suspend fun majConcept(
+        concept: Concept,
+        jour: String,
+        aime: Boolean? = null,
+        prolonger: Boolean? = null,
+        vers: String? = null,
+    ): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val jeton = jeton()
+            val uid = utilisateur() ?: return@runCatching false
+            val ligne = buildJsonObject {
+                put("user_id", uid)
+                put("slug", concept.id)
+                put("titre", concept.titre)
+                put("theme", concept.theme)
+                put("wikipedia_url", concept.source.url)
+                put("a_retenir", concept.aRetenir)
+                put("a_raconter", concept.aRaconter)
+                put("qcm", json.encodeToJsonElement(fr.dash.chevet.model.Qcm.serializer(), concept.qcm))
+                put("lot_jour", jour)
+                aime?.let { put("aime", it) }
+                prolonger?.let {
+                    put("prolonger", it)
+                    put("prolonger_vers", if (it) vers else null)
+                }
+            }
+            val (code, _) = requete(
+                "POST",
+                "/rest/v1/chevet_concepts?on_conflict=user_id,slug",
+                buildJsonArray { add(ligne) }.toString(),
+                jeton,
+                mapOf("Prefer" to "resolution=merge-duplicates,return=minimal"),
+            )
+            code in 200..299
+        }.getOrDefault(false)
+    }
+
+    // ------------------------------------------------------------ Boîte à curiosités (menu)
+
+    /** Dépose une curiosité ; elle nourrira la prochaine composition de portes. */
+    suspend fun envoyerCuriosite(texte: String, url: String?, origine: String): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val corps = buildJsonObject {
+                put("texte", texte)
+                put("url", url)
+                put("origine", origine)
+            }
+            val (code, _) = requete(
+                "POST",
+                "/rest/v1/chevet_curiosites",
+                corps.toString(),
+                jeton(),
+                mapOf("Prefer" to "return=minimal"),
+            )
+            code in 200..299
+        }.getOrDefault(false)
+    }
+
+    /** Les 30 dernières curiosités ; null hors connexion. */
+    suspend fun curiosites(): List<Curiosite>? = withContext(Dispatchers.IO) {
+        runCatching {
+            val (code, texte) = requete(
+                "GET",
+                "/rest/v1/chevet_curiosites?select=id,texte,url,statut,cree_le&order=cree_le.desc&limit=30",
+                jeton = jeton(),
+            )
+            if (code !in 200..299) return@runCatching null
+            json.decodeFromString(kotlinx.serialization.builtins.ListSerializer(Curiosite.serializer()), texte)
+        }.getOrNull()
     }
 
     // ------------------------------------------------------------ Profil (réglages)

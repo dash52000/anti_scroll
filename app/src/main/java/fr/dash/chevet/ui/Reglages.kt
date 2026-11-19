@@ -68,7 +68,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import fr.dash.chevet.Rappel
+import fr.dash.chevet.data.CartesParConcept
 import fr.dash.chevet.data.Cran
+import fr.dash.chevet.data.MotsParCarte
 import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
 import fr.dash.chevet.data.Niveaux
@@ -97,6 +99,7 @@ fun EcranReglages(
     soiree: Soiree,
     journal: Journal,
     etatLot: String,
+    ficheDirecte: Boolean = false,
     onFermer: (avant: Profil?, apres: Profil?) -> Unit,
     onRejouer: () -> Unit,
     onRegenererLot: () -> Unit,
@@ -108,7 +111,8 @@ fun EcranReglages(
     var original by remember { mutableStateOf<Profil?>(null) }
     var brouillon by remember { mutableStateOf<Profil?>(null) }
     var chargement by remember { mutableStateOf(true) }
-    var page by remember { mutableStateOf(PageReglages.Principal) }
+    // Depuis le menu, « Ce que Chevet sait de moi » ouvre directement la fiche.
+    var page by remember { mutableStateOf(if (ficheDirecte) PageReglages.Fiche else PageReglages.Principal) }
 
     var coucher by remember { mutableStateOf(soiree.coucher()) }
     var notif by remember { mutableStateOf(soiree.notifActive) }
@@ -136,7 +140,7 @@ fun EcranReglages(
     }
 
     val fermer: () -> Unit = {
-        if (page == PageReglages.Fiche) {
+        if (page == PageReglages.Fiche && !ficheDirecte) {
             page = PageReglages.Principal
         } else {
             soiree.declencheur = declencheur
@@ -281,6 +285,36 @@ fun EcranReglages(
                             }
                             Text(
                                 "À 0, un thème disparaît ; à 100, il revient le plus souvent.",
+                                color = EncreDouce,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+
+                            Spacer(Modifier.height(20.dp))
+                            SousTitre("Longueur des cartes")
+                            Text("Mots par carte", color = Encre)
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                MotsParCarte.entries.forEach { cran ->
+                                    FilterChip(
+                                        selected = b.motsParCarte == cran.valeur,
+                                        onClick = { maj { it.copy(motsParCarte = cran.valeur) } },
+                                        label = { Text(cran.libelle) },
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text("Cartes par concept", color = Encre)
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                CartesParConcept.entries.forEach { cran ->
+                                    FilterChip(
+                                        selected = b.cartesParConcept == cran.valeur,
+                                        onClick = { maj { it.copy(cartesParConcept = cran.valeur) } },
+                                        label = { Text(cran.libelle) },
+                                    )
+                                }
+                            }
+                            Text(
+                                "L'IA choisit dans la fourchette selon le concept. Trois « trop dense » en une semaine " +
+                                    "font descendre les mots par carte d'un cran.",
                                 color = EncreDouce,
                                 style = MaterialTheme.typography.bodySmall,
                             )
