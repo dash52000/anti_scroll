@@ -1,6 +1,8 @@
 package fr.dash.chevet.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -28,6 +30,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -63,9 +67,11 @@ import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import fr.dash.chevet.data.Coeurs
 import fr.dash.chevet.data.ConceptVu
 import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
+import fr.dash.chevet.data.PorteProposee
 import fr.dash.chevet.data.Preparation
 import fr.dash.chevet.data.Profil
 import fr.dash.chevet.data.Progression
@@ -85,6 +91,7 @@ private sealed interface Etape {
     data object Portes : Etape
     data object Fil : Etape
     data object Recap : Etape
+    data object AutrePorte : Etape
     data object DejaFini : Etape
 }
 
@@ -96,29 +103,45 @@ internal sealed interface Regen {
     data class Suite(val porteId: String, val gardes: Int, override val preparation: Preparation) : Regen
 }
 
+/** « D'autres portes » : 3 portes neuves composées, puis la porte choisie écrite, en arrière-plan. */
+internal sealed interface Bonus {
+    data object Aucun : Bonus
+    data object Composition : Bonus
+    data class Choix(val demande: String, val portes: List<PorteProposee>) : Bonus
+    data class Ecriture(val choix: Choix, val porte: PorteProposee, val preparation: Preparation) : Bonus
+    data class Echec(val message: String) : Bonus
+}
+
 private const val CONCEPTS_PAR_PORTE = 3
+
+/** Plafond du fil borné : 3 portes ouvertes par soir au plus. */
+internal const val PLAFOND_PORTES = 3
 
 @Composable
 fun ChevetApp(
     lotInitial: Lot,
     lotExemple: Boolean,
     progression: Progression,
+    coeurs: Coeurs,
     journal: Journal,
     distant: Distant,
     soiree: Soiree,
     onPartager: (String) -> Unit,
     onRejouer: () -> Unit,
     onBonneNuit: () -> Unit,
+    onQuitter: () -> Unit,
     bandeau: String? = null,
     reprendreRegeneration: Boolean = false,
+    partageEntrant: String? = null,
     onConceptsExplores: (List<Concept>) -> Unit = {},
 ) {
-    val revisions = remember { progression.revisionsDues() }
+    val revisions = remember { progression.revisionsDues(coeurs::conceptAime) }
     var lot by remember { mutableStateOf(lotInitial) }
+    var ouvertes by remember { mutableStateOf(progression.portesOuvertes()) }
     var etape by remember {
         mutableStateOf<Etape>(
             when {
-                progression.lotConsomme() -> Etape.DejaFini
+                progression.lotConsomme() || ouvertes.size >= PLAFOND_PORTES -> Etape.DejaFini
                 revisions.isNotEmpty() -> Etape.Echauffement
                 else -> Etape.Portes
             }
@@ -131,19 +154,30 @@ fun ChevetApp(
     var creusagesParSoir by remember { mutableIntStateOf(soiree.creusagesParSoir) }
     var creusagesFaits by remember { mutableIntStateOf(0) }
     var conceptsDuSoir by remember { mutableStateOf<List<Concept>>(emptyList()) }
-    var reglages by remember { mutableStateOf(false) }
+    var nouvellesFeuilles by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var reglages by remember { mutableStateOf<Boolean?>(null) }
+    var menu by remember { mutableStateOf(if (partageEntrant != null) PageMenu.Curiosites else null) }
     var regen by remember { mutableStateOf<Regen?>(null) }
     var tache by remember { mutableStateOf<Job?>(null) }
+    var bonus by remember { mutableStateOf<Bonus>(Bonus.Aucun) }
+    var tacheBonus by remember { mutableStateOf<Job?>(null) }
     var annonce by remember { mutableStateOf<String?>(null) }
     val portee = rememberCoroutineScope()
+    val uri = LocalUriHandler.current
 
-    // La nuit tombe au fil du rituel.
+    val restantes = lot.portes.filter { it.id !in ouvertes }
+    val plafondAtteint = ouvertes.size >= PLAFOND_PORTES
+    val peutAutrePorte = !plafondAtteint && ouvertes.isNotEmpty() && etape != Etape.Fil
+
+    // La nuit tombe au fil du rituel ; chaque nouvelle porte repart d'un ciel un peu plus sombre.
+    val debutFil = (0.25f + 0.15f * (ouvertes.size - 1).coerceAtLeast(0)).coerceAtMost(0.55f)
     val nuit = when (etape) {
         Etape.Echauffement -> 0.05f
         Etape.Pepite -> 0.12f
         Etape.Portes -> 0.2f
-        Etape.Fil -> 0.25f + 0.6f * progresFil
+        Etape.Fil -> debutFil + (0.85f - debutFil) * progresFil
         Etape.Recap -> 0.9f
+        Etape.AutrePorte -> 0.85f
         Etape.DejaFini -> 0.95f
     }
 
@@ -158,6 +192,40 @@ fun ChevetApp(
         if (annonce != null) {
             delay(3500)
             annonce = null
+        }
+    }
+
+    // ------------------------------------------------ Cœurs
+
+    /** Pose ou retire un cœur ; le serveur apprend quand un concept devient aimé (ou ne l'est plus). */
+    val basculerCoeur: (Concept, Int, String, String?) -> Unit = { c, carte, texte, jour ->
+        val avant = coeurs.conceptAime(c.id)
+        val aimee = coeurs.basculer(c, carte, texte)
+        journal.note(if (aimee) "like" else "unlike", "concept" to c.id, "carte" to carte)
+        val apres = coeurs.conceptAime(c.id)
+        if (avant != apres && jour != null) portee.launch { distant.majConcept(c, jour, aime = apres) }
+    }
+
+    // ------------------------------------------------ « Trop dense » : la longueur s'ajuste toute seule
+
+    fun tropDense() {
+        if (soiree.noterTropDense() < 3) return
+        portee.launch {
+            val profil = distant.profil() ?: return@launch
+            soiree.oublierTropDense()
+            val plusCourt = when (profil.motsParCarte) {
+                60 -> 40
+                40 -> 25
+                else -> null
+            }
+            if (plusCourt == null) {
+                annonce = "Noté. Les cartes sont déjà au plus court : le conteur gardera des idées plus simples."
+                return@launch
+            }
+            val ok = distant.enregistrerProfil(profil.copy(motsParCarte = plusCourt))
+            journal.note("longueur_auto", "mots" to plusCourt, "ok" to ok)
+            annonce = "Tu trouves ça dense : je passe à $plusCourt mots par carte dès le prochain lot. " +
+                "Tu peux revenir en arrière dans les réglages."
         }
     }
 
@@ -224,12 +292,12 @@ fun ChevetApp(
                     annonce = "C'est noté : ça vaudra pour le lot de demain."
                 }
             }
-            Etape.Recap, Etape.DejaFini -> annonce = "C'est noté : ça vaudra pour le lot de demain."
+            Etape.Recap, Etape.AutrePorte, Etape.DejaFini -> annonce = "C'est noté : ça vaudra pour le lot de demain."
         }
     }
 
     val fermerReglages: (Profil?, Profil?) -> Unit = { avant, apres ->
-        reglages = false
+        reglages = null
         if (apres != null && apres != avant) {
             creusagesParSoir = apres.creusagesParSoir
             soiree.creusagesParSoir = apres.creusagesParSoir
@@ -245,14 +313,77 @@ fun ChevetApp(
         }
     }
 
+    // ------------------------------------------------ Portes : la première, puis les autres
+
+    fun ouvrirPorte(porte: Porte) {
+        progression.ouvrirPorte(porte.id)
+        ouvertes = progression.portesOuvertes()
+        journal.note("porte_choisie", "porte" to porte.id, "rang" to ouvertes.size)
+        porteFil = porte
+        conceptCourant = 0
+        progresFil = 0f
+        etape = Etape.Fil
+    }
+
+    fun composerBonus() {
+        tacheBonus?.cancel()
+        val demande = System.currentTimeMillis().toString()
+        bonus = Bonus.Composition
+        journal.note("bonus_demande")
+        tacheBonus = portee.launch {
+            val portes = distant.composerBonus(demande)
+            bonus = if (portes.isNullOrEmpty()) {
+                Bonus.Echec("Le conteur n'a pas trouvé d'autres portes. Réessaie dans un moment.")
+            } else {
+                Bonus.Choix(demande, portes)
+            }
+        }
+    }
+
+    fun ecrireBonus(choix: Bonus.Choix, proposee: PorteProposee) {
+        tacheBonus?.cancel()
+        bonus = Bonus.Ecriture(choix, proposee, Preparation(0, 3))
+        journal.note("bonus_choisie", "porte" to proposee.id)
+        tacheBonus = portee.launch {
+            val porte = distant.ecrireBonus(choix.demande, proposee.id) { p ->
+                val b = bonus
+                if (b is Bonus.Ecriture) bonus = b.copy(preparation = p)
+            }
+            if (porte == null) {
+                bonus = choix
+                annonce = "Cette porte n'a pas pu s'écrire : choisis-en une autre."
+                return@launch
+            }
+            lot = lot.copy(portes = lot.portes + porte)
+            bonus = Bonus.Aucun
+            if (etape == Etape.AutrePorte && progression.portesOuvertes().size < PLAFOND_PORTES) {
+                ouvrirPorte(porte)
+            } else {
+                annonce = "Ta porte « ${porte.titre} » est prête."
+            }
+        }
+    }
+
     val direBonneNuit: () -> Unit = {
         journal.note("bonne_nuit")
+        menu = null
         etoiles = true
     }
     val rejouer: () -> Unit = {
         journal.note("rejouer_test")
         progression.reinitialiserPourTest()
         onRejouer()
+    }
+    val allerAutrePorte: () -> Unit = {
+        journal.note("autre_porte_ouverte")
+        menu = null
+        etape = Etape.AutrePorte
+    }
+
+    // Le geste retour, pendant la soirée, ouvre le menu (la soirée reste gardée).
+    BackHandler(enabled = menu == null && reglages == null && !etoiles) {
+        journal.note("menu_ouvert", "par" to "retour")
+        menu = PageMenu.Accueil
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -280,22 +411,21 @@ fun ChevetApp(
                     portes = lot.portes,
                     bandeau = bandeau,
                     preparation = (regen as? Regen.Lot)?.preparation,
-                ) { porte ->
-                    journal.note("porte_choisie", "porte" to porte.id)
-                    porteFil = porte
-                    conceptCourant = 0
-                    etape = Etape.Fil
-                }
+                    onChoix = { ouvrirPorte(it) },
+                )
 
                 Etape.Fil -> porteFil?.let { porte ->
                     EcranFil(
                         porte = porte,
                         attente = (regen as? Regen.Suite)?.takeIf { it.porteId == porte.id },
                         journal = journal,
+                        coeurs = coeurs,
                         creusagesRestants = (creusagesParSoir - creusagesFaits).coerceAtLeast(0),
                         creusagesParSoir = creusagesParSoir,
                         creuser = { concept, question -> distant.creuser(concept, question) },
                         onCreuser = { creusagesFaits += 1 },
+                        onCoeur = { c, carte, texte -> basculerCoeur(c, carte, texte, if (lotExemple) null else lot.jour) },
+                        onTropDense = { tropDense() },
                         onPartager = onPartager,
                         onProgres = { progresFil = it },
                         onConcept = { conceptCourant = it },
@@ -305,10 +435,11 @@ fun ChevetApp(
                             regen = null
                         },
                         onFin = {
-                            progression.marquerVus(porte.concepts)
+                            progression.marquerVus(porte)
                             progression.marquerLotConsomme()
                             onConceptsExplores(porte.concepts)
                             conceptsDuSoir = porte.concepts
+                            nouvellesFeuilles = porte.concepts.map { it.id }.toSet()
                             journal.note("fil_termine", "porte" to porte.id)
                             etape = Etape.Recap
                         },
@@ -318,52 +449,130 @@ fun ChevetApp(
                 Etape.Recap -> EcranRecap(
                     concepts = conceptsDuSoir,
                     teaser = lot.teaserDemain,
-                    totalTerrier = progression.nombreDeConcepts(),
+                    terrier = progression.tous(),
+                    aime = coeurs::conceptAime,
+                    nouvelles = nouvellesFeuilles,
+                    autrePorte = autrePorteLibelle(peutAutrePorte, ouvertes.size),
+                    onAutrePorte = allerAutrePorte,
+                    onBonneNuit = direBonneNuit,
+                )
+
+                Etape.AutrePorte -> EcranAutrePorte(
+                    restantes = restantes,
+                    ouvertes = ouvertes.size,
+                    plafondAtteint = plafondAtteint,
+                    bonus = bonus,
+                    onChoix = { ouvrirPorte(it) },
+                    onDautres = { composerBonus() },
+                    onChoixBonus = { choix, p -> ecrireBonus(choix, p) },
                     onBonneNuit = direBonneNuit,
                 )
 
                 Etape.DejaFini -> EcranDejaFini(
                     teaser = lot.teaserDemain,
-                    totalTerrier = progression.nombreDeConcepts(),
+                    terrier = progression.tous(),
+                    aime = coeurs::conceptAime,
+                    autrePorte = autrePorteLibelle(peutAutrePorte, ouvertes.size),
+                    onAutrePorte = allerAutrePorte,
                     onBonneNuit = direBonneNuit,
                 )
             }
         }
 
-        // Engrenage discret : les réglages s'ouvrent par-dessus la soirée, sans la perdre.
-        if (!reglages && !etoiles) {
-            IconButton(
-                onClick = {
-                    journal.note("reglages_ouverts")
-                    reglages = true
-                },
-                modifier = Modifier
+        // Icône maison et engrenage, discrets : le menu et les réglages s'ouvrent par-dessus la soirée.
+        if (menu == null && reglages == null && !etoiles) {
+            Row(
+                Modifier
                     .align(Alignment.TopEnd)
                     .systemBarsPadding()
                     .padding(4.dp),
             ) {
-                Icon(
-                    Icons.Filled.Settings,
-                    contentDescription = "Réglages",
-                    tint = Encre.copy(alpha = 0.35f),
-                    modifier = Modifier.size(20.dp),
-                )
+                IconButton(onClick = {
+                    journal.note("menu_ouvert", "par" to "maison")
+                    menu = PageMenu.Accueil
+                }) {
+                    Icon(Icons.Filled.Home, contentDescription = "Menu", tint = Encre.copy(alpha = 0.35f), modifier = Modifier.size(20.dp))
+                }
+                IconButton(onClick = {
+                    journal.note("reglages_ouverts")
+                    reglages = false
+                }) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Réglages", tint = Encre.copy(alpha = 0.35f), modifier = Modifier.size(20.dp))
+                }
             }
         }
 
-        if (reglages) {
+        menu?.let { page ->
+            EcranMenu(
+                page = page,
+                nuit = nuit,
+                soiree = EtatSoiree(
+                    ceSoir = when (etape) {
+                        Etape.Echauffement -> "Reprendre l'échauffement"
+                        Etape.Pepite -> "Revoir la pépite"
+                        Etape.Portes -> "Choisir ma porte"
+                        Etape.Fil -> "Reprendre ma porte"
+                        Etape.Recap -> "Revoir le récap"
+                        Etape.AutrePorte -> "Choisir une autre porte"
+                        Etape.DejaFini -> "Ce soir"
+                    },
+                    detail = when (etape) {
+                        Etape.Fil -> porteFil?.let { "« ${it.titre} »" }.orEmpty()
+                        Etape.Portes -> "${lot.portes.size} portes t'attendent"
+                        Etape.DejaFini -> if (peutAutrePorte) "Ta porte est lue ; une autre reste possible" else "C'est tout pour aujourd'hui"
+                        else -> ""
+                    },
+                    autrePorte = when {
+                        etape == Etape.Fil -> "Finis d'abord ta porte en cours"
+                        ouvertes.isEmpty() -> "Après ta première porte"
+                        plafondAtteint -> "Plafond atteint : $PLAFOND_PORTES portes ce soir"
+                        else -> "${restantes.size} restante${if (restantes.size > 1) "s" else ""}, ou 3 neuves · ${ouvertes.size}/$PLAFOND_PORTES ce soir"
+                    },
+                    autrePortePossible = peutAutrePorte,
+                ),
+                progression = progression,
+                coeurs = coeurs,
+                distant = distant,
+                journal = journal,
+                creusagesRestants = (creusagesParSoir - creusagesFaits).coerceAtLeast(0),
+                creusagesParSoir = creusagesParSoir,
+                partage = partageEntrant,
+                actions = ActionsMenu(
+                    onPage = { menu = it },
+                    onCeSoir = {
+                        journal.note("menu_ce_soir")
+                        menu = null
+                    },
+                    onAutrePorte = allerAutrePorte,
+                    onReglages = { fiche -> reglages = fiche },
+                    onCoeur = basculerCoeur,
+                    onSource = { url -> runCatching { uri.openUri(url) } },
+                    onPartager = onPartager,
+                    onAnnonce = { annonce = it },
+                    onCreuse = { creusagesFaits += 1 },
+                    onQuitter = {
+                        journal.note("quitter_menu")
+                        onQuitter()
+                    },
+                ),
+            )
+        }
+
+        reglages?.let { fiche ->
             EcranReglages(
                 distant = distant,
                 soiree = soiree,
                 journal = journal,
                 etatLot = if (lotExemple) "lot d'exemple" else "serveur, ${lot.jour}",
+                ficheDirecte = fiche,
                 onFermer = fermerReglages,
                 onRejouer = {
-                    reglages = false
+                    reglages = null
                     rejouer()
                 },
                 onRegenererLot = {
-                    reglages = false
+                    reglages = null
+                    menu = null
                     lancerRegenLot(reprise = false)
                 },
                 onAnnonce = { annonce = it },
@@ -384,6 +593,9 @@ fun ChevetApp(
         }
     }
 }
+
+private fun autrePorteLibelle(possible: Boolean, ouvertes: Int): String? =
+    if (possible) "Une autre porte ? (${ouvertes}/$PLAFOND_PORTES ce soir)" else null
 
 // ---------------------------------------------------------------- Briques communes
 
@@ -545,33 +757,156 @@ private fun EcranPortes(
         Spacer(Modifier.height(6.dp))
         Text("Trois portes. Laquelle tu pousses ?", color = Encre, style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(20.dp))
-        portes.forEach { porte ->
-            Panneau(
-                Modifier
-                    .padding(vertical = 6.dp)
-                    .clickable { onChoix(porte) },
-            ) {
-                if (porte.mystere) {
-                    Etiquette("Porte mystère")
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        porte.indice ?: "…",
-                        color = Encre,
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontStyle = FontStyle.Italic,
-                    )
-                } else {
-                    Text(
-                        porte.titre,
-                        color = Encre,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(porte.accroche, color = EncreDouce, style = MaterialTheme.typography.bodyMedium)
-                }
-            }
+        // Les portes bonus d'un soir précédent de la journée s'ajoutent au lot : on garde les 3 du matin.
+        portes.take(3).forEach { porte ->
+            CartePorte(porte.titre, porte.accroche, porte.mystere, porte.indice) { onChoix(porte) }
         }
+    }
+}
+
+@Composable
+private fun CartePorte(titre: String, accroche: String, mystere: Boolean, indice: String?, onClick: () -> Unit) {
+    Panneau(
+        Modifier
+            .padding(vertical = 6.dp)
+            .clickable(onClick = onClick),
+    ) {
+        if (mystere) {
+            Etiquette("Porte mystère")
+            Spacer(Modifier.height(6.dp))
+            Text(
+                indice ?: "…",
+                color = Encre,
+                style = MaterialTheme.typography.bodyLarge,
+                fontStyle = FontStyle.Italic,
+            )
+        } else {
+            Text(
+                titre,
+                color = Encre,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(accroche, color = EncreDouce, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Autre porte
+
+@Composable
+private fun EcranAutrePorte(
+    restantes: List<Porte>,
+    ouvertes: Int,
+    plafondAtteint: Boolean,
+    bonus: Bonus,
+    onChoix: (Porte) -> Unit,
+    onDautres: () -> Unit,
+    onChoixBonus: (Bonus.Choix, PorteProposee) -> Unit,
+    onBonneNuit: () -> Unit,
+) {
+    Colonne {
+        Spacer(Modifier.height(40.dp))
+        Etiquette("Autre porte · $ouvertes/$PLAFOND_PORTES ce soir")
+        Spacer(Modifier.height(6.dp))
+        if (plafondAtteint) {
+            Text(
+                "Trois portes ce soir : le fil est bouclé. La suite demain matin.",
+                color = Encre,
+                style = MaterialTheme.typography.headlineSmall,
+            )
+            Spacer(Modifier.height(24.dp))
+            Button(onClick = onBonneNuit, modifier = Modifier.fillMaxWidth()) { Text("Bonne nuit") }
+        } else {
+            ChoixAutrePorte(restantes, bonus, onChoix, onDautres, onChoixBonus, onBonneNuit)
+        }
+    }
+}
+
+@Composable
+private fun ColumnScope.ChoixAutrePorte(
+    restantes: List<Porte>,
+    bonus: Bonus,
+    onChoix: (Porte) -> Unit,
+    onDautres: () -> Unit,
+    onChoixBonus: (Bonus.Choix, PorteProposee) -> Unit,
+    onBonneNuit: () -> Unit,
+) {
+    Text("Encore une ?", color = Encre, style = MaterialTheme.typography.headlineSmall)
+    Spacer(Modifier.height(16.dp))
+
+    if (restantes.isNotEmpty()) {
+        Etiquette("Les portes de ce soir")
+        Spacer(Modifier.height(4.dp))
+        restantes.forEach { porte ->
+            CartePorte(porte.titre, porte.accroche, porte.mystere, porte.indice) { onChoix(porte) }
+        }
+        Spacer(Modifier.height(16.dp))
+    }
+
+    when (bonus) {
+        Bonus.Aucun, is Bonus.Echec -> {
+            if (bonus is Bonus.Echec) {
+                Text(bonus.message, color = EncreDouce, style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(8.dp))
+            }
+            OutlinedButton(onClick = onDautres, modifier = Modifier.fillMaxWidth()) {
+                Text(if (restantes.isEmpty()) "Composer 3 portes neuves" else "Aucune ne me tente : d'autres portes", color = Encre)
+            }
+            Text(
+                "Le conteur en compose 3 en une vingtaine de secondes ; celle que tu choisis s'écrit en une minute environ.",
+                color = EncreDouce.copy(alpha = 0.7f),
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+
+        Bonus.Composition -> {
+            Etiquette("Portes neuves")
+            Spacer(Modifier.height(8.dp))
+            Text("Le conteur compose trois portes…", color = Encre, style = MaterialTheme.typography.bodyLarge, fontStyle = FontStyle.Italic)
+            Spacer(Modifier.height(10.dp))
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Ambre, trackColor = Voile)
+        }
+
+        is Bonus.Choix -> {
+            Etiquette("Portes neuves")
+            Spacer(Modifier.height(4.dp))
+            bonus.portes.forEach { p ->
+                CartePorte(p.titre, p.accroche, p.mystere, p.indice) { onChoixBonus(bonus, p) }
+            }
+            TextButton(onClick = onDautres) { Text("Recomposer", color = EncreDouce) }
+        }
+
+        is Bonus.Ecriture -> {
+            Etiquette("Porte neuve")
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Le conteur écrit « ${if (bonus.porte.mystere) "la porte mystère" else bonus.porte.titre} »…",
+                color = Encre,
+                style = MaterialTheme.typography.bodyLarge,
+                fontStyle = FontStyle.Italic,
+            )
+            Spacer(Modifier.height(10.dp))
+            LinearProgressIndicator(
+                progress = { bonus.preparation.etape.toFloat() / bonus.preparation.total.coerceAtLeast(1) },
+                modifier = Modifier.fillMaxWidth(),
+                color = Ambre,
+                trackColor = Voile,
+            )
+            Text(
+                "Étape ${bonus.preparation.etape} sur ${bonus.preparation.total}",
+                color = EncreDouce,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+
+    Spacer(Modifier.height(24.dp))
+    TextButton(onClick = onBonneNuit, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+        Text("Non, bonne nuit", color = EncreDouce)
     }
 }
 
@@ -589,7 +924,7 @@ private sealed interface Page {
 }
 
 private enum class Action(val libelle: String, val icone: ImageVector, val code: String, val retour: String) {
-    Jaime("J'aime", Icons.Filled.Favorite, "like", "Noté : plus de ce genre"),
+    Jaime("J'aime", Icons.Filled.FavoriteBorder, "like", "Noté : plus de ce genre"),
     Bof("Bof", Icons.Filled.Close, "pas_pour_moi", "Noté : moins de ce genre"),
     Creuser("Creuser", Icons.Filled.Search, "creuser", ""),
     JeSavais("Je savais", Icons.Filled.Check, "je_savais", "Noté : on montera d'un cran"),
@@ -604,10 +939,13 @@ private fun EcranFil(
     porte: Porte,
     attente: Regen.Suite?,
     journal: Journal,
+    coeurs: Coeurs,
     creusagesRestants: Int,
     creusagesParSoir: Int,
     creuser: suspend (Concept, String) -> String,
     onCreuser: () -> Unit,
+    onCoeur: (Concept, Int, String) -> Unit,
+    onTropDense: () -> Unit,
     onPartager: (String) -> Unit,
     onProgres: (Float) -> Unit,
     onConcept: (Int) -> Unit,
@@ -663,7 +1001,16 @@ private fun EcranFil(
         }
     }
 
-    val concept = pages[etatPager.currentPage.coerceIn(0, pages.lastIndex)].concept
+    val pageCourante = pages[etatPager.currentPage.coerceIn(0, pages.lastIndex)]
+    val concept = pageCourante.concept
+    // Le cœur se pose sur la page affichée : une carte, la phrase à retenir (-1) ou la question (-2).
+    val cibleCoeur: Pair<Int, String>? = when (pageCourante) {
+        is Page.Texte -> pageCourante.numero to pageCourante.carte.texte
+        is Page.ARetenir -> -1 to concept.aRetenir
+        is Page.Question -> -2 to concept.question
+        is Page.Attente -> null
+    }
+    val aimee = cibleCoeur != null && coeurs.aime(concept.id, cibleCoeur.first)
 
     Column(Modifier.fillMaxSize().systemBarsPadding()) {
         Box(Modifier.weight(1f)) {
@@ -692,12 +1039,31 @@ private fun EcranFil(
                 )
             }
         }
-        BarreActions { action ->
-            journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
+        BarreActions(aimee = aimee) { action ->
             when (action) {
-                Action.Creuser -> voletCreuser = true
-                Action.Partager -> onPartager("${concept.aRaconter}\n\n(via Chevet)")
-                else -> message = action.retour
+                Action.Jaime -> {
+                    // Le journal note « like » ou « unlike » au moment de basculer.
+                    val (carte, texte) = cibleCoeur ?: return@BarreActions
+                    onCoeur(concept, carte, texte)
+                    if (!aimee) message = action.retour
+                }
+                Action.Creuser -> {
+                    journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
+                    voletCreuser = true
+                }
+                Action.Partager -> {
+                    journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
+                    onPartager("${concept.aRaconter}\n\n(via Chevet)")
+                }
+                Action.Dense -> {
+                    journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
+                    message = action.retour
+                    onTropDense()
+                }
+                else -> {
+                    journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
+                    message = action.retour
+                }
             }
         }
     }
@@ -846,7 +1212,9 @@ private fun PageAttente(titrePorte: String, preparation: Preparation?, onLireAnc
 }
 
 @Composable
-private fun BarreActions(onAction: (Action) -> Unit) {
+private fun BarreActions(aimee: Boolean, onAction: (Action) -> Unit) {
+    // Le cœur se remplit avec un petit rebond.
+    val rebond by animateFloatAsState(if (aimee) 1f else 0f, label = "coeur")
     Row(
         Modifier
             .fillMaxWidth()
@@ -855,21 +1223,32 @@ private fun BarreActions(onAction: (Action) -> Unit) {
         horizontalArrangement = Arrangement.SpaceEvenly,
     ) {
         Action.entries.forEach { action ->
+            val coeur = action == Action.Jaime
             Column(
                 Modifier
                     .clickable { onAction(action) }
                     .padding(4.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Icon(action.icone, contentDescription = action.libelle, tint = Encre)
-                Text(action.libelle, color = EncreDouce, fontSize = 10.sp)
+                if (coeur) {
+                    val echelle = 1f + 0.3f * kotlin.math.sin(rebond * Math.PI.toFloat())
+                    Icon(
+                        if (aimee) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                        contentDescription = if (aimee) "Retirer le cœur" else action.libelle,
+                        tint = if (aimee) Ambre else Encre,
+                        modifier = Modifier.size((24 * echelle).dp),
+                    )
+                } else {
+                    Icon(action.icone, contentDescription = action.libelle, tint = Encre)
+                }
+                Text(action.libelle, color = if (coeur && aimee) Ambre else EncreDouce, fontSize = 10.sp)
             }
         }
     }
 }
 
 @Composable
-private fun VoletCreuser(
+internal fun VoletCreuser(
     concept: Concept,
     restants: Int,
     parSoir: Int,
@@ -928,7 +1307,7 @@ private fun VoletCreuser(
 }
 
 /** Questions de secours quand le lot n'en propose pas. */
-private fun questionsSuggerees(c: Concept) = listOf(
+internal fun questionsSuggerees(c: Concept) = listOf(
     "D'où vient « ${c.titre} » ?",
     "Un exemple concret, près de chez moi ?",
     "Et aujourd'hui, où en est-on ?",
@@ -940,7 +1319,11 @@ private fun questionsSuggerees(c: Concept) = listOf(
 private fun EcranRecap(
     concepts: List<Concept>,
     teaser: String,
-    totalTerrier: Int,
+    terrier: List<ConceptVu>,
+    aime: (String) -> Boolean,
+    nouvelles: Set<String>,
+    autrePorte: String?,
+    onAutrePorte: () -> Unit,
     onBonneNuit: () -> Unit,
 ) {
     Colonne {
@@ -955,36 +1338,73 @@ private fun EcranRecap(
                 modifier = Modifier.padding(vertical = 4.dp),
             )
         }
-        FinDeSoiree(teaser, totalTerrier, onBonneNuit)
+        FinDeSoiree(teaser, terrier, aime, nouvelles, autrePorte, onAutrePorte, onBonneNuit)
     }
 }
 
 @Composable
-private fun EcranDejaFini(teaser: String, totalTerrier: Int, onBonneNuit: () -> Unit) {
+private fun EcranDejaFini(
+    teaser: String,
+    terrier: List<ConceptVu>,
+    aime: (String) -> Boolean,
+    autrePorte: String?,
+    onAutrePorte: () -> Unit,
+    onBonneNuit: () -> Unit,
+) {
     Colonne {
         Spacer(Modifier.height(32.dp))
         Etiquette("C'est tout pour aujourd'hui")
         Spacer(Modifier.height(12.dp))
         Text(
-            "Le lot du jour est fini. Le prochain sera prêt demain matin.",
+            if (autrePorte != null) {
+                "Ta porte du soir est lue. Si l'envie dure, une autre t'attend ; sinon, à demain."
+            } else {
+                "Le lot du jour est fini. Le prochain sera prêt demain matin."
+            },
             color = Encre,
             style = MaterialTheme.typography.bodyLarge,
         )
-        FinDeSoiree(teaser, totalTerrier, onBonneNuit)
+        FinDeSoiree(teaser, terrier, aime, emptySet(), autrePorte, onAutrePorte, onBonneNuit)
     }
 }
 
 @Composable
-private fun ColumnScope.FinDeSoiree(teaser: String, totalTerrier: Int, onBonneNuit: () -> Unit) {
+private fun ColumnScope.FinDeSoiree(
+    teaser: String,
+    terrier: List<ConceptVu>,
+    aime: (String) -> Boolean,
+    nouvelles: Set<String>,
+    autrePorte: String?,
+    onAutrePorte: () -> Unit,
+    onBonneNuit: () -> Unit,
+) {
     Spacer(Modifier.height(24.dp))
     Etiquette("Demain")
     Spacer(Modifier.height(6.dp))
     Text(teaser, color = EncreDouce, style = MaterialTheme.typography.bodyLarge, fontStyle = FontStyle.Italic)
-    Spacer(Modifier.height(24.dp))
-    Text(
-        "Ton terrier : $totalTerrier concept${if (totalTerrier > 1) "s" else ""}",
-        color = Ambre,
+    Spacer(Modifier.height(16.dp))
+    // L'arbre du terrier : les feuilles du soir poussent sous les yeux.
+    Arbre(
+        concepts = terrier,
+        aime = aime,
+        nouvelles = nouvelles,
+        modifier = Modifier.fillMaxWidth().height(220.dp),
     )
-    Spacer(Modifier.height(32.dp))
+    val fruits = terrier.count { it.maitrise }
+    Text(
+        "Ton terrier : ${terrier.size} concept${if (terrier.size > 1) "s" else ""}" +
+            (if (nouvelles.isNotEmpty()) ", dont ${nouvelles.size} de ce soir" else "") +
+            (if (fruits > 0) " · $fruits fruit${if (fruits > 1) "s" else ""}" else ""),
+        color = Ambre,
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.align(Alignment.CenterHorizontally),
+    )
+    Spacer(Modifier.height(24.dp))
+    if (autrePorte != null) {
+        OutlinedButton(onClick = onAutrePorte, modifier = Modifier.fillMaxWidth()) {
+            Text(autrePorte, color = Encre)
+        }
+        Spacer(Modifier.height(8.dp))
+    }
     Button(onClick = onBonneNuit, modifier = Modifier.fillMaxWidth()) { Text("Bonne nuit") }
 }

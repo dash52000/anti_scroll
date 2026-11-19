@@ -30,6 +30,8 @@ data class Profil(
     @SerialName("creusages_par_soir") val creusagesParSoir: Int = 3,
     val declencheur: String? = null,
     @SerialName("heure_coucher") val heureCoucher: String? = null,
+    @SerialName("mots_par_carte") val motsParCarte: Int = 40,
+    @SerialName("cartes_par_concept") val cartesParConcept: String = "2-4",
 ) {
     /** Vrai si ce qui nourrit les lots a changé (pas la soirée ni le quota de « creuser »). */
     fun contenuDiffere(autre: Profil): Boolean =
@@ -37,7 +39,23 @@ data class Profil(
             aEviter != autre.aEviter ||
             sources != autre.sources ||
             poidsThemes != autre.poidsThemes ||
-            fiche != autre.fiche
+            fiche != autre.fiche ||
+            motsParCarte != autre.motsParCarte ||
+            cartesParConcept != autre.cartesParConcept
+}
+
+/** Les trois crans de mots par carte. */
+enum class MotsParCarte(val valeur: Int, val libelle: String) {
+    Court(25, "Court · 25"),
+    Moyen(40, "Moyen · 40"),
+    Long(60, "Long · 60"),
+}
+
+/** Les trois crans de cartes par concept ; l'IA choisit dans la fourchette selon la complexité. */
+enum class CartesParConcept(val valeur: String, val libelle: String) {
+    Peu("1-2", "1 à 2"),
+    Normal("2-4", "2 à 4"),
+    Beaucoup("4-6", "4 à 6"),
 }
 
 /** Les trois crans de niveau par domaine. */

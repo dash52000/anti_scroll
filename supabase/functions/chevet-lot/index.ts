@@ -20,6 +20,16 @@
 //                            par appel ; « demande » identifie la demande (une nouvelle repart de zéro).
 //   {"action":"tester_flux","url":"..."}  vérifie qu'une URL donne un flux RSS lisible.
 //
+// Actions du menu (avec le JWT de l'utilisateur) :
+//   {"action":"bonus","demande":"..."}   « d'autres portes » : compose 3 portes neuves pour ce soir
+//                                         (sans répéter celles du lot) et renvoie leurs titres.
+//   {"action":"bonus","demande":"...","porte":"id"}
+//                                         écrit la porte bonus choisie, une étape par appel
+//                                         (rédaction, relecture, assemblage) ; elle rejoint le lot.
+//   {"action":"voisins","url":"...","titre":"...","slug":"..."}
+//                                         articles Wikipédia liés à un concept, pas encore explorés,
+//                                         choisis par l'IA pour le graphe du terrier (gardés en cache).
+//
 // Tout est idempotent : un lot prêt ne bouge plus, donc un appel en trop ne coûte rien.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
@@ -32,6 +42,7 @@ const MODELE_VERIFICATION = "openai/gpt-oss-120b";
 const UA = "Chevet/0.1 (https://github.com/dash52000/anti_scroll)";
 const NB_ETAPES = 8;
 const NB_ETAPES_SUITE = 4;
+const NB_ETAPES_BONUS = 3;
 const CONCEPTS_PAR_PORTE = 3;
 
 const admin = createClient(
@@ -325,6 +336,15 @@ function poidsThemes(profil: Json): Record<string, number> {
   return poids;
 }
 
+const FOURCHETTES_CARTES: Record<string, [number, number]> = { "1-2": [1, 2], "2-4": [2, 4], "4-6": [4, 6] };
+
+/** Longueur des cartes réglée par le lecteur : mots par carte et fourchette de cartes par concept. */
+function longueurCartes(profil: Json): { mots: number; min: number; max: number } {
+  const mots = [25, 40, 60].includes(Number(profil?.mots_par_carte)) ? Number(profil.mots_par_carte) : 40;
+  const [min, max] = FOURCHETTES_CARTES[String(profil?.cartes_par_concept)] ?? [2, 4];
+  return { mots, min, max };
+}
+
 function consigneThemes(profil: Json): string {
   const poids = poidsThemes(profil);
   return `Poids des thèmes réglés par le lecteur (0 = jamais, 100 = le plus souvent) : ${
@@ -404,23 +424,52 @@ const SYSTEME_CHEVET =
 
 // ------------------------------------------------------------------ Étape 0 : composer
 
-async function composer(lot: Json, profil: Json) {
+/** Ce qu'une composition de portes bonus ne doit pas répéter : les portes et concepts de ce soir. */
+type Exclusions = { portes: string[]; concepts: string[]; graines: number[] };
+
+/**
+ * Compose 3 portes. Sans [bonus], c'est le lot du matin ; avec, ce sont des portes en plus
+ * pour ce soir (« d'autres portes »), qui ne touchent pas aux concepts à prolonger demain.
+ */
+async function composer(lot: Json, profil: Json, bonus?: Exclusions) {
   const userId = lot.user_id;
   const filtreUser = <T extends { is: Json; eq: Json }>(q: T) => (userId ? q.eq("user_id", userId) : q.is("user_id", null));
 
   const { data: anciens } = await filtreUser(
     admin.from("chevet_lots").select("jour, contenu").neq("id", lot.id).order("jour", { ascending: false }).limit(14),
   );
-  const portesPassees = (anciens ?? []).flatMap((l: Json) => (l.contenu?.portes ?? []).map((p: Json) => p.titre));
+  const portesPassees = [
+    ...(bonus?.portes ?? []),
+    ...(anciens ?? []).flatMap((l: Json) => (l.contenu?.portes ?? []).map((p: Json) => p.titre)),
+  ];
 
   const { data: vus } = await filtreUser(
     admin.from("chevet_concepts").select("titre, wikipedia_url").order("decouvert_le", { ascending: false }).limit(30),
   );
-  const conceptsVus = (vus ?? []).map((c: Json) => c.titre);
+  const conceptsVus = [...(bonus?.concepts ?? []), ...(vus ?? []).map((c: Json) => c.titre)];
 
-  // Candidats du terrier : liens sortants des 3 derniers concepts explorés.
+  // Concepts aimés (un cœur sur une carte) et concepts que le lecteur veut prolonger demain.
+  const { data: aimesBruts } = await filtreUser(
+    admin.from("chevet_concepts").select("titre, wikipedia_url").eq("aime", true)
+      .order("decouvert_le", { ascending: false }).limit(20),
+  );
+  const aimes: Json[] = aimesBruts ?? [];
+  let prolonges: Json[] = [];
+  if (!bonus) {
+    const { data } = await filtreUser(
+      admin.from("chevet_concepts").select("id, titre, wikipedia_url, prolonger_vers").eq("prolonger", true)
+        .order("decouvert_le", { ascending: false }).limit(3),
+    );
+    prolonges = data ?? [];
+  }
+
+  // Candidats du terrier : liens sortants des concepts à prolonger, de 2 concepts aimés et des derniers explorés.
+  const departs: Json[] = [];
+  for (const c of [...prolonges, ...melanger(aimes).slice(0, 2), ...(vus ?? []).slice(0, 3)]) {
+    if (c.wikipedia_url && !departs.some((d) => d.wikipedia_url === c.wikipedia_url)) departs.push(c);
+  }
   const candidatsTerrier: string[] = [];
-  for (const c of (vus ?? []).slice(0, 3)) {
+  for (const c of departs.slice(0, 5)) {
     const m = (c.wikipedia_url ?? "").match(/https:\/\/(\w+)\.wikipedia\.org\/wiki\/(.+)$/);
     if (!m) continue;
     try {
@@ -439,9 +488,10 @@ async function composer(lot: Json, profil: Json) {
   const flux = await lireFlux(profil.sources_rss ?? []);
   const actu = flux.articles.slice(0, 25).map((a) => `- [${a.media}] ${a.titre} — ${a.resume.slice(0, 120)}`).join("\n");
 
-  const grainesUtilisees = new Set<number>(
-    (anciens ?? []).flatMap((l: Json) => (l.contenu?.graines ?? []) as number[]),
-  );
+  const grainesUtilisees = new Set<number>([
+    ...(bonus?.graines ?? []),
+    ...(anciens ?? []).flatMap((l: Json) => (l.contenu?.graines ?? []) as number[]),
+  ]);
   const graines = (profil.graines ?? [])
     .map((g: Json, index: number) => ({ ...g, index }))
     .filter((g: Json) => !grainesUtilisees.has(g.index));
@@ -458,17 +508,23 @@ ${graines.map((g: Json) => `- graine n° ${g.index} : question « ${g.question} 
 Portes déjà proposées ces derniers jours (ne pas répéter) : ${portesPassees.join(" ; ") || "aucune"}
 Concepts déjà explorés (ne pas répéter) : ${conceptsVus.join(" ; ") || "aucun"}
 
-Pistes du terrier (articles Wikipédia liés aux derniers concepts) :
+Pistes du terrier (articles Wikipédia liés à des concepts déjà explorés) :
 ${candidatsTerrier.join("\n") || "aucune"}
 
-Curiosités notées par le lecteur aujourd'hui : ${curiosites.map((c) => c.texte || c.url).join(" ; ") || "aucune"}
+Concepts aimés par le lecteur (un cœur sur une de leurs cartes) : ${aimes.map((c) => `« ${c.titre} »`).join(" ; ") || "aucun"}
+${prolonges.length ? `Le lecteur a demandé à prolonger : ${prolonges.map((c) => `« ${c.titre} »${c.prolonger_vers ? ` (vers « ${c.prolonger_vers} »)` : ""}`).join(" ; ")}` : ""}
+
+Curiosités notées par le lecteur : ${curiosites.map((c) => c.texte || c.url).join(" ; ") || "aucune"}
 
 Actu du jour (sources choisies par le lecteur) :
 ${actu || "indisponible"}
 
-Compose le lot de ce soir : exactement 3 portes, chacune ouvrant sur un tunnel de 3 concepts.
+${bonus
+    ? "Le lecteur a déjà lu une porte ce soir et en veut d'autres : compose exactement 3 portes neuves, chacune ouvrant sur un tunnel de 3 concepts. Aucune ne reprend une porte ni un concept de ce soir."
+    : "Compose le lot de ce soir : exactement 3 portes, chacune ouvrant sur un tunnel de 3 concepts."}
 Règles :
 - ${premierSoir ? "C'est le tout premier soir : fais un best of, au moins 2 portes issues des graines." : "Si des graines restent, une porte au moins en est issue."}
+${prolonges.length ? "- Une porte au moins prolonge un concept que le lecteur a demandé à prolonger (type terrier), en partant de lui ou du voisin indiqué.\n" : ""}- Les portes qui prolongent le terrier partent de préférence des concepts aimés.
 - Si une curiosité existe, une porte en part.
 - Au plus une porte « actu » : un article du jour ouvre sur un concept de fond qui l'éclaire. Jamais de faits divers.
 - Une porte peut prolonger le terrier ; une autre peut faire un saut vers un thème différent.
@@ -508,6 +564,7 @@ Format JSON :
     graines: portes.map((p: Json) => p.graine).filter((g: Json) => Number.isInteger(g)),
     teaserDemain: resultat.teaserDemain ?? "",
     curiosites: curiosites.map((c) => c.id),
+    prolonges: prolonges.map((c) => c.id),
     flux: flux.etat,
   };
 }
@@ -521,6 +578,11 @@ async function rediger(travail: Json, i: number, profil: Json) {
   for (const c of porte.concepts) {
     if (!c.extrait) c.extrait = await extrait(c.wiki.titre, c.wiki.langue, [...cles, ...motsDe(c.titre)]);
   }
+
+  // Longueur réglée par le lecteur ; la relecture en a besoin pour borner les cartes gardées.
+  const longueur = longueurCartes(profil);
+  porte.cartesMin = longueur.min;
+  porte.cartesMax = longueur.max;
 
   // Réécriture de la suite d'une porte : le lecteur a déjà lu le début du tunnel.
   const dejaLus: string[] = porte.dejaLus ?? [];
@@ -536,7 +598,7 @@ ${porte.concepts.map((c: Json, k: number) => `### Concept ${k + 1} : ${c.titre} 
 Écris les cartes de chaque concept.
 Règles :
 - N'utilise que des faits présents dans l'article fourni. Pas de chiffre, de date ni de nom qui n'y figure pas.
-- 2 à 5 cartes par concept, 40 mots au plus par carte, une idée par carte.
+- ${longueur.min} à ${longueur.max} cartes par concept selon sa complexité, ${longueur.mots} mots au plus par carte, une idée par carte.
 - Raconte : la première carte pose une scène datée, un lieu ou une personne réelle de l'article ; pas de définition de dictionnaire, pas de liste, pas de jargon.
 - Au moins une carte par concept contient une date ou un chiffre de l'article.
 - Relie le concept à la question de la porte : explique le pourquoi, pas seulement le quoi.
@@ -628,6 +690,9 @@ Réponds dans le même ordre, un objet par concept relu :
     return;
   }
 
+  // Fourchette réglée par le lecteur (2 à 4 par défaut) : en dessous du minimum, le concept tombe.
+  const minimum = Math.max(1, Math.min(2, Number(porte.cartesMin) || 2));
+  const maximum = Math.max(minimum, Number(porte.cartesMax) || 5);
   let retirees = 0;
   valides.forEach(({ r: original, k }: Json, n: number) => {
     const relu = relus[n];
@@ -636,10 +701,10 @@ Réponds dans le même ordre, un objet par concept relu :
       const ok = typeof c === "object" && c.texte && estProuve(c.preuve, source);
       if (!ok) retirees++;
       return ok;
-    }).map((c: Json) => c.texte);
+    }).map((c: Json) => c.texte).slice(0, maximum);
     const odg = relu.ordreDeGrandeur;
     // La relecture ne touche qu'aux cartes, aux synthèses et au chiffre ; le reste vient de la rédaction.
-    porte.redaction[k] = cartes.length < 2 ? { titre: original.titre, horsSujet: true } : {
+    porte.redaction[k] = cartes.length < minimum ? { titre: original.titre, horsSujet: true } : {
       ...original,
       cartes,
       aRetenir: relu.aRetenir || cartes.at(-1),
@@ -709,6 +774,10 @@ Format JSON : {"texte":"..."}`,
   // Les curiosités utilisées sortent de la boîte.
   if (travail.curiosites?.length) {
     await admin.from("chevet_curiosites").update({ statut: "porte_generee" }).in("id", travail.curiosites);
+  }
+  // Les concepts à prolonger ont nourri ce lot : la demande est servie.
+  if (travail.prolonges?.length) {
+    await admin.from("chevet_concepts").update({ prolonger: false, prolonger_vers: null }).in("id", travail.prolonges);
   }
 
   return {
@@ -821,6 +890,7 @@ function etatPublic(lot: Json) {
 
 const CHAMPS_REGLABLES = [
   "niveaux", "a_eviter", "sources_rss", "poids_themes", "fiche", "creusages_par_soir", "declencheur", "heure_coucher",
+  "mots_par_carte", "cartes_par_concept",
 ];
 
 /** Le profil réglable de l'utilisateur. La fiche est tirée du profil de départ au premier passage. */
@@ -879,6 +949,10 @@ async function enregistrerProfil(userId: string, valeurs: Json) {
       .slice(0, 30);
   }
   if (v.creusages_par_soir !== undefined) maj.creusages_par_soir = borne(v.creusages_par_soir, 1, 10, 3);
+  if ([25, 40, 60].includes(Number(v.mots_par_carte))) maj.mots_par_carte = Number(v.mots_par_carte);
+  if (typeof v.cartes_par_concept === "string" && v.cartes_par_concept in FOURCHETTES_CARTES) {
+    maj.cartes_par_concept = v.cartes_par_concept;
+  }
   if (typeof v.declencheur === "string") maj.declencheur = texte(v.declencheur, 200);
   if (typeof v.heure_coucher === "string" && /^\d{2}:\d{2}/.test(v.heure_coucher)) {
     maj.heure_coucher = v.heure_coucher.slice(0, 5);
@@ -1032,6 +1106,164 @@ async function suite(userId: string, porteId: string, nbGardes: number, demande:
   return etat(s.fini ? "pret" : s.abandon ? "erreur" : "en_cours");
 }
 
+// ------------------------------------------------------------------ Menu : d'autres portes
+
+/** Ce que les portes bonus ne doivent pas répéter : les portes, concepts et graines de ce soir. */
+function exclusionsDuSoir(lot: Json): Exclusions {
+  const portes: Json[] = lot.contenu?.portes ?? [];
+  return {
+    portes: portes.map((p) => p.titre),
+    concepts: portes.flatMap((p) => (p.concepts ?? []).map((c: Json) => c.titre)),
+    graines: (lot.contenu?.graines ?? []) as number[],
+  };
+}
+
+/**
+ * « D'autres portes », une étape par appel. Sans [porteId] : compose 3 portes neuves et renvoie
+ * leurs titres. Avec : rédige, relit puis ajoute au lot la porte choisie, et la renvoie.
+ * [demande] identifie la demande : une nouvelle recompose de zéro.
+ */
+async function bonus(userId: string, demande: string, porteId: string | null) {
+  const lot = await lotDuJour(userId);
+  if (lot.statut !== "pret") return { statut: "indisponible", total: NB_ETAPES_BONUS };
+
+  const travail = lot.travail ?? {};
+  if (travail.bonus?.cle !== demande) travail.bonus = { cle: demande, tentatives: 0, etapes: {}, ecrites: {} };
+  const b = travail.bonus;
+  const resume = (p: Json) => ({
+    id: p.id,
+    titre: p.titre,
+    accroche: p.accroche,
+    mystere: !!p.mystere,
+    indice: p.indice ?? null,
+  });
+  const etat = (statut: string, extra: Json = {}) => ({
+    statut,
+    etape: porteId ? (b.etapes?.[porteId] ?? 0) : 0,
+    total: NB_ETAPES_BONUS,
+    erreur: b.erreur ?? null,
+    ...extra,
+  });
+
+  // Déjà fait : rien à recalculer.
+  if (!porteId && b.portes) return etat("choix", { portes: b.portes.map(resume) });
+  if (porteId && b.ecrites?.[porteId]) return etat("pret", { porte: b.ecrites[porteId] });
+  if (b.abandon) return etat("erreur");
+  if (porteId && !b.portes?.some((p: Json) => p.id === porteId)) return etat("indisponible");
+  if (!(await verrouiller(lot))) return { ...etat("en_cours"), occupe: true };
+
+  const profil = await profilDe(userId);
+  const maj: Json = { verrou_jusqua: null };
+  let resultat: Json;
+  try {
+    if (!porteId) {
+      const compo = await composer(lot, profil, exclusionsDuSoir(lot));
+      if (compo.portes.length === 0) throw new Error("Aucune porte composée");
+      b.portes = compo.portes;
+      if (compo.curiosites.length) {
+        await admin.from("chevet_curiosites").update({ statut: "porte_generee" }).in("id", compo.curiosites);
+      }
+      resultat = etat("choix", { portes: b.portes.map(resume) });
+    } else {
+      const pt = b.portes.find((p: Json) => p.id === porteId);
+      const etape = b.etapes[porteId] ?? 0;
+      if (etape === 0) {
+        await rediger({ portes: [pt] }, 0, profil);
+      } else if (etape === 1) {
+        await relire({ portes: [pt] }, 0);
+      } else {
+        const concepts = conceptsRediges(pt);
+        if (concepts.length === 0) throw new Error("Porte vide après relecture");
+        const contenu = lot.contenu;
+        let id = pt.id;
+        while ((contenu.portes ?? []).some((p: Json) => p.id === id)) id += "-b";
+        const porte = { ...resume(pt), id, concepts, bonus: true };
+        contenu.portes = [...(contenu.portes ?? []), porte];
+        maj.contenu = contenu;
+        b.ecrites[porteId] = porte;
+      }
+      b.etapes[porteId] = etape + 1;
+      resultat = b.ecrites[porteId] ? etat("pret", { porte: b.ecrites[porteId] }) : etat("en_cours");
+    }
+    b.erreur = null;
+    b.tentatives = 0;
+  } catch (e) {
+    b.erreur = String(e).slice(0, 500);
+    if (!(e instanceof LimiteGroq)) {
+      b.tentatives = (b.tentatives ?? 0) + 1;
+      if (b.tentatives >= 3) b.abandon = true;
+    }
+    resultat = etat(b.abandon ? "erreur" : "en_cours");
+  }
+  maj.travail = travail;
+
+  const { data: apres } = await admin.from("chevet_lots").update(maj)
+    .eq("id", lot.id).eq("genere_le", lot.genere_le).select("id").maybeSingle();
+  if (!apres) return etat("indisponible");
+  return resultat;
+}
+
+// ------------------------------------------------------------------ Menu : voisins d'un concept
+
+function titreDepuisUrl(url: string | null | undefined): string {
+  const m = (url ?? "").match(/\/wiki\/(.+)$/);
+  return m ? decodeURIComponent(m[1]).replaceAll("_", " ") : "";
+}
+
+/** Articles liés à un concept, pas encore explorés, choisis par l'IA ; gardés en cache par concept. */
+async function voisins(userId: string, url: string, titre: string, slugConcept: string) {
+  if (slugConcept) {
+    const { data } = await admin.from("chevet_concepts").select("voisins")
+      .eq("user_id", userId).eq("slug", slugConcept).maybeSingle();
+    if (Array.isArray(data?.voisins) && data.voisins.length) return { voisins: data.voisins };
+  }
+  const m = url.match(/https:\/\/(\w+)\.wikipedia\.org\/wiki\/(.+)$/);
+  if (!m) return { voisins: [] };
+  const langue = m[1];
+  const liens = await liensSortants(decodeURIComponent(m[2]).replaceAll("_", " "), langue);
+
+  const { data: vus } = await admin.from("chevet_concepts").select("titre, wikipedia_url").eq("user_id", userId);
+  const dejaVus = new Set(
+    (vus ?? []).flatMap((c: Json) => [normaliser(c.titre ?? ""), normaliser(titreDepuisUrl(c.wikipedia_url))]),
+  );
+  const candidats = liens.filter((t) =>
+    !dejaVus.has(normaliser(t)) && !/^(Liste|Chronologie|Portail|Catégorie|Aide|Modèle|\d)/.test(t)
+  );
+  if (candidats.length === 0) return { voisins: [] };
+
+  const profil = await profilDe(userId);
+  let choisis: { titre: string; accroche: string }[] = [];
+  try {
+    const r = await groq(
+      MODELE_RELECTURE,
+      SYSTEME_CHEVET,
+      `${portraitLecteur(profil)}
+
+Le lecteur a exploré « ${titre} ». Voici des articles Wikipédia liés : ${melanger(candidats).slice(0, 80).join(" ; ")}
+Choisis les 6 qui lui donneraient le plus envie de continuer : des sujets concrets, des histoires, des mécanismes ;
+pas de listes, ni de pays, de villes ou d'années trop générales. Recopie chaque titre exactement.
+Pour chacun, une accroche de 12 mots au plus qui tutoie le lecteur.
+Format JSON : {"voisins":[{"titre":"titre exact","accroche":"..."}]}`,
+      900,
+      0.4,
+    );
+    choisis = (r.voisins ?? []).filter((v: Json) => v?.titre && candidats.includes(v.titre));
+  } catch (_) {
+    // Sans l'IA : un tirage au hasard parmi les liens.
+  }
+  if (choisis.length === 0) choisis = melanger(candidats).slice(0, 6).map((t) => ({ titre: t, accroche: "" }));
+
+  const resultat = choisis.slice(0, 6).map((v) => ({
+    titre: v.titre,
+    accroche: String(v.accroche ?? "").slice(0, 140),
+    url: urlArticle(v.titre, langue),
+  }));
+  if (slugConcept && resultat.length) {
+    await admin.from("chevet_concepts").update({ voisins: resultat }).eq("user_id", userId).eq("slug", slugConcept);
+  }
+  return { voisins: resultat };
+}
+
 // ------------------------------------------------------------------ Réglages : nouvelle source
 
 /** Vérifie qu'une URL donne un flux RSS ou Atom lisible, et propose un nom. */
@@ -1100,6 +1332,15 @@ Deno.serve(async (req) => {
         return reponse(await suite(userId, String(corps.porte ?? ""), Number(corps.gardes ?? 1), String(corps.demande ?? "")));
       case "tester_flux":
         return reponse(await testerFlux(String(corps.url ?? "")));
+      case "bonus":
+        return reponse(await bonus(userId, String(corps.demande ?? ""), corps.porte ? String(corps.porte) : null));
+      case "voisins":
+        return reponse(await voisins(
+          userId,
+          String(corps.url ?? ""),
+          String(corps.titre ?? ""),
+          String(corps.slug ?? ""),
+        ));
       default:
         return reponse({ erreur: `Action inconnue : ${action}` }, 400);
     }

@@ -20,6 +20,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import fr.dash.chevet.data.Coeurs
 import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
 import fr.dash.chevet.data.LotCharge
@@ -35,9 +36,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 fun Racine(
     distant: Distant,
     progression: Progression,
+    coeurs: Coeurs,
     journal: Journal,
     soiree: Soiree,
     lotExemple: () -> Lot,
+    partageEntrant: String?,
     onPartager: (String) -> Unit,
     onRejouer: () -> Unit,
     onFermer: () -> Unit,
@@ -73,6 +76,7 @@ fun Racine(
         lotInitial = pret.lot,
         lotExemple = pret.exemple,
         progression = progression,
+        coeurs = coeurs,
         journal = journal,
         distant = distant,
         soiree = soiree,
@@ -84,10 +88,19 @@ fun Racine(
                 onFermer()
             }
         },
+        onQuitter = {
+            portee.launch {
+                withTimeoutOrNull(4_000) { distant.envoyerJournal(journal) }
+                onFermer()
+            }
+        },
         bandeau = pret.message,
         reprendreRegeneration = reprendre,
+        partageEntrant = partageEntrant,
         onConceptsExplores = { concepts ->
-            if (!pret.exemple) portee.launch { distant.enregistrerConcepts(concepts, pret.lot.jour) }
+            if (!pret.exemple) {
+                portee.launch { distant.enregistrerConcepts(concepts, pret.lot.jour, coeurs.conceptsAimes()) }
+            }
         },
     )
 }
