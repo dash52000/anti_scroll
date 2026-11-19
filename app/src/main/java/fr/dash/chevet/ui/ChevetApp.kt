@@ -46,6 +46,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -65,6 +66,7 @@ import fr.dash.chevet.model.Concept
 import fr.dash.chevet.model.Lot
 import fr.dash.chevet.model.Porte
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /** Les étapes du rituel du soir. */
 private sealed interface Etape {
@@ -84,6 +86,9 @@ fun ChevetApp(
     onPartager: (String) -> Unit,
     onRejouer: () -> Unit,
     onBonneNuit: () -> Unit,
+    bandeau: String? = null,
+    creuser: suspend (Concept, String) -> String = { _, _ -> "Pas encore branché." },
+    onConceptsExplores: (List<Concept>) -> Unit = {},
 ) {
     val revisions = remember { progression.revisionsDues() }
     var etape by remember {
@@ -145,7 +150,7 @@ fun ChevetApp(
 
                 Etape.Pepite -> EcranPepite(lot.pepite) { etape = Etape.Portes }
 
-                Etape.Portes -> EcranPortes(lot.portes) { porte ->
+                Etape.Portes -> EcranPortes(lot.portes, bandeau) { porte ->
                     journal.note("porte_choisie", "porte" to porte.id)
                     etape = Etape.Fil(porte)
                 }
@@ -154,12 +159,14 @@ fun ChevetApp(
                     porte = e.porte,
                     journal = journal,
                     creusagesRestants = creusagesRestants,
+                    creuser = creuser,
                     onCreuser = { creusagesRestants -= 1 },
                     onPartager = onPartager,
                     onProgres = { progresFil = it },
                     onFin = {
                         progression.marquerVus(e.porte.concepts)
                         progression.marquerLotConsomme()
+                        onConceptsExplores(e.porte.concepts)
                         conceptsDuSoir = e.porte.concepts
                         journal.note("fil_termine", "porte" to e.porte.id)
                         etape = Etape.Recap
@@ -211,7 +218,7 @@ private fun Panneau(modifier: Modifier = Modifier, content: @Composable ColumnSc
 }
 
 @Composable
-private fun Etiquette(texte: String) {
+internal fun Etiquette(texte: String) {
     Text(
         texte.uppercase(),
         color = Ambre,
@@ -318,9 +325,13 @@ private fun EcranPepite(pepite: Carte, onSuite: () -> Unit) {
 // ---------------------------------------------------------------- Portes
 
 @Composable
-private fun EcranPortes(portes: List<Porte>, onChoix: (Porte) -> Unit) {
+private fun EcranPortes(portes: List<Porte>, bandeau: String?, onChoix: (Porte) -> Unit) {
     Colonne {
         Spacer(Modifier.height(32.dp))
+        if (bandeau != null) {
+            Text(bandeau, color = EncreDouce.copy(alpha = 0.7f), fontSize = 12.sp)
+            Spacer(Modifier.height(12.dp))
+        }
         Etiquette("Ce soir")
         Spacer(Modifier.height(6.dp))
         Text("Trois portes. Laquelle tu pousses ?", color = Encre, style = MaterialTheme.typography.headlineSmall)
@@ -381,6 +392,7 @@ private fun EcranFil(
     porte: Porte,
     journal: Journal,
     creusagesRestants: Int,
+    creuser: suspend (Concept, String) -> String,
     onCreuser: () -> Unit,
     onPartager: (String) -> Unit,
     onProgres: (Float) -> Unit,
@@ -467,7 +479,11 @@ private fun EcranFil(
             VoletCreuser(
                 concept = concept,
                 restants = creusagesRestants,
-                onCreuser = onCreuser,
+                creuser = creuser,
+                onCreuser = { question ->
+                    journal.note("creuser_question", "concept" to concept.id, "question" to question)
+                    onCreuser()
+                },
                 onFermer = { voletCreuser = false },
             )
         }
@@ -581,13 +597,24 @@ private fun BarreActions(onAction: (Action) -> Unit) {
 }
 
 @Composable
-private fun VoletCreuser(concept: Concept, restants: Int, onCreuser: () -> Unit, onFermer: () -> Unit) {
+private fun VoletCreuser(
+    concept: Concept,
+    restants: Int,
+    creuser: suspend (Concept, String) -> String,
+    onCreuser: (String) -> Unit,
+    onFermer: () -> Unit,
+) {
     var question by remember { mutableStateOf<String?>(null) }
+    var reponseIa by remember { mutableStateOf<String?>(null) }
+    val portee = rememberCoroutineScope()
+    val suggestions = concept.creuser.ifEmpty { questionsSuggerees(concept) }
+
     Column(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 24.dp, vertical = 8.dp)
-            .navigationBarsPadding(),
+            .navigationBarsPadding()
+            .verticalScroll(rememberScrollState()),
     ) {
         Etiquette("Creuser · $restants/3 ce soir")
         Spacer(Modifier.height(12.dp))
@@ -595,10 +622,11 @@ private fun VoletCreuser(concept: Concept, restants: Int, onCreuser: () -> Unit,
         when {
             choisie != null -> {
                 Text(choisie, color = Encre, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(10.dp))
                 Text(
-                    "La réponse arrivera ici quand « creuser » sera branché sur Groq (prochaine étape).",
-                    color = EncreDouce,
+                    reponseIa ?: "Le conteur réfléchit…",
+                    color = if (reponseIa == null) EncreDouce else Encre,
+                    style = MaterialTheme.typography.bodyLarge,
                 )
             }
 
@@ -607,11 +635,12 @@ private fun VoletCreuser(concept: Concept, restants: Int, onCreuser: () -> Unit,
                 color = EncreDouce,
             )
 
-            else -> questionsSuggerees(concept).forEach { q ->
+            else -> suggestions.forEach { q ->
                 OutlinedButton(
                     onClick = {
                         question = q
-                        onCreuser()
+                        onCreuser(q)
+                        portee.launch { reponseIa = creuser(concept, q) }
                     },
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                 ) {
@@ -625,7 +654,7 @@ private fun VoletCreuser(concept: Concept, restants: Int, onCreuser: () -> Unit,
     }
 }
 
-/** Provisoire : l'IA proposera des questions propres à chaque carte. */
+/** Questions de secours quand le lot n'en propose pas. */
 private fun questionsSuggerees(c: Concept) = listOf(
     "D'où vient « ${c.titre} » ?",
     "Un exemple concret, près de chez moi ?",

@@ -37,6 +37,8 @@ data class Concept(
     val source: Source,
     /** QCM servi plus tard, en révision. */
     val qcm: Qcm,
+    /** Questions suggérées pour « creuser ». */
+    val creuser: List<String> = emptyList(),
 )
 
 @Serializable
