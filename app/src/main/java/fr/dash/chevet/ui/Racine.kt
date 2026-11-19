@@ -25,6 +25,7 @@ import fr.dash.chevet.data.Journal
 import fr.dash.chevet.data.LotCharge
 import fr.dash.chevet.data.Preparation
 import fr.dash.chevet.data.Progression
+import fr.dash.chevet.data.Soiree
 import fr.dash.chevet.model.Lot
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -35,6 +36,7 @@ fun Racine(
     distant: Distant,
     progression: Progression,
     journal: Journal,
+    soiree: Soiree,
     lotExemple: () -> Lot,
     onPartager: (String) -> Unit,
     onRejouer: () -> Unit,
@@ -52,8 +54,11 @@ fun Racine(
             "exemple" to resultat.exemple,
             "message" to resultat.message,
         )
+        if (!resultat.exemple) soiree.memoriserLot(resultat.lot)
         charge = resultat
         distant.envoyerJournal(journal)
+        // Des réglages enregistrés hors ligne partent maintenant.
+        distant.renvoyerProfilEnAttente()
     }
 
     val pret = charge
@@ -62,10 +67,15 @@ fun Racine(
         return
     }
 
+    val reprendre = remember(pret) { !pret.exemple && distant.regenerationEnCours() }
+
     ChevetApp(
-        lot = pret.lot,
+        lotInitial = pret.lot,
+        lotExemple = pret.exemple,
         progression = progression,
         journal = journal,
+        distant = distant,
+        soiree = soiree,
         onPartager = onPartager,
         onRejouer = onRejouer,
         onBonneNuit = {
@@ -75,7 +85,7 @@ fun Racine(
             }
         },
         bandeau = pret.message,
-        creuser = { concept, question -> distant.creuser(concept, question) },
+        reprendreRegeneration = reprendre,
         onConceptsExplores = { concepts ->
             if (!pret.exemple) portee.launch { distant.enregistrerConcepts(concepts, pret.lot.jour) }
         },

@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -29,11 +30,14 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
@@ -47,6 +51,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -59,38 +64,57 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import fr.dash.chevet.data.ConceptVu
+import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
+import fr.dash.chevet.data.Preparation
+import fr.dash.chevet.data.Profil
 import fr.dash.chevet.data.Progression
+import fr.dash.chevet.data.Soiree
 import fr.dash.chevet.model.Carte
 import fr.dash.chevet.model.Concept
 import fr.dash.chevet.model.Lot
 import fr.dash.chevet.model.Porte
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/** Les étapes du rituel du soir. */
+/** Les étapes du rituel du soir. La porte du fil est gardée à part, pour pouvoir la réécrire. */
 private sealed interface Etape {
     data object Echauffement : Etape
     data object Pepite : Etape
     data object Portes : Etape
-    data class Fil(val porte: Porte) : Etape
+    data object Fil : Etape
     data object Recap : Etape
     data object DejaFini : Etape
 }
 
+/** Régénération en arrière-plan après un changement de réglages. */
+internal sealed interface Regen {
+    val preparation: Preparation
+
+    data class Lot(override val preparation: Preparation) : Regen
+    data class Suite(val porteId: String, val gardes: Int, override val preparation: Preparation) : Regen
+}
+
+private const val CONCEPTS_PAR_PORTE = 3
+
 @Composable
 fun ChevetApp(
-    lot: Lot,
+    lotInitial: Lot,
+    lotExemple: Boolean,
     progression: Progression,
     journal: Journal,
+    distant: Distant,
+    soiree: Soiree,
     onPartager: (String) -> Unit,
     onRejouer: () -> Unit,
     onBonneNuit: () -> Unit,
     bandeau: String? = null,
-    creuser: suspend (Concept, String) -> String = { _, _ -> "Pas encore branché." },
+    reprendreRegeneration: Boolean = false,
     onConceptsExplores: (List<Concept>) -> Unit = {},
 ) {
     val revisions = remember { progression.revisionsDues() }
+    var lot by remember { mutableStateOf(lotInitial) }
     var etape by remember {
         mutableStateOf<Etape>(
             when {
@@ -100,17 +124,25 @@ fun ChevetApp(
             }
         )
     }
+    var porteFil by remember { mutableStateOf<Porte?>(null) }
+    var conceptCourant by remember { mutableIntStateOf(0) }
     var progresFil by remember { mutableFloatStateOf(0f) }
     var etoiles by remember { mutableStateOf(false) }
-    var creusagesRestants by remember { mutableIntStateOf(3) }
+    var creusagesParSoir by remember { mutableIntStateOf(soiree.creusagesParSoir) }
+    var creusagesFaits by remember { mutableIntStateOf(0) }
     var conceptsDuSoir by remember { mutableStateOf<List<Concept>>(emptyList()) }
+    var reglages by remember { mutableStateOf(false) }
+    var regen by remember { mutableStateOf<Regen?>(null) }
+    var tache by remember { mutableStateOf<Job?>(null) }
+    var annonce by remember { mutableStateOf<String?>(null) }
+    val portee = rememberCoroutineScope()
 
     // La nuit tombe au fil du rituel.
     val nuit = when (etape) {
         Etape.Echauffement -> 0.05f
         Etape.Pepite -> 0.12f
         Etape.Portes -> 0.2f
-        is Etape.Fil -> 0.25f + 0.6f * progresFil
+        Etape.Fil -> 0.25f + 0.6f * progresFil
         Etape.Recap -> 0.9f
         Etape.DejaFini -> 0.95f
     }
@@ -119,6 +151,97 @@ fun ChevetApp(
         LaunchedEffect(Unit) {
             delay(2500)
             onBonneNuit()
+        }
+    }
+
+    LaunchedEffect(annonce) {
+        if (annonce != null) {
+            delay(3500)
+            annonce = null
+        }
+    }
+
+    // ------------------------------------------------ Régénération en arrière-plan
+
+    fun lancerRegenLot(reprise: Boolean) {
+        tache?.cancel()
+        journal.note("regeneration", "type" to "lot", "reprise" to reprise)
+        regen = Regen.Lot(Preparation(0, 8))
+        tache = portee.launch {
+            val nouveau = distant.regenererLot(reprise) { p -> if (regen is Regen.Lot) regen = Regen.Lot(p) }
+            regen = null
+            if (nouveau == null) {
+                journal.note("regeneration_echec", "type" to "lot")
+                annonce = "Le nouveau lot n'a pas pu être préparé : on garde celui-ci."
+                return@launch
+            }
+            journal.note("regeneration_ok", "type" to "lot")
+            soiree.memoriserLot(nouveau)
+            lot = nouveau
+            if (etape == Etape.Portes) annonce = "De nouvelles portes t'attendent."
+        }
+    }
+
+    fun lancerSuite(porte: Porte, gardes: Int) {
+        tache?.cancel()
+        val demande = System.currentTimeMillis().toString()
+        journal.note("regeneration", "type" to "suite", "porte" to porte.id, "gardes" to gardes)
+        regen = Regen.Suite(porte.id, gardes, Preparation(0, 4))
+        tache = portee.launch {
+            val nouvelle = distant.suite(porte.id, gardes, demande) { p ->
+                val r = regen
+                if (r is Regen.Suite) regen = r.copy(preparation = p)
+            }
+            regen = null
+            if (nouvelle == null) {
+                journal.note("regeneration_echec", "type" to "suite")
+                annonce = "La suite n'a pas pu être réécrite : tu lis la version d'origine."
+                return@launch
+            }
+            lot = lot.copy(portes = lot.portes.map { if (it.id == nouvelle.id) nouvelle else it })
+            if (etape == Etape.Fil && porteFil?.id == nouvelle.id) {
+                journal.note("regeneration_ok", "type" to "suite")
+                porteFil = nouvelle
+            }
+        }
+    }
+
+    // Une régénération lancée avant une fermeture de l'appli reprend en arrière-plan.
+    LaunchedEffect(Unit) {
+        if (reprendreRegeneration) lancerRegenLot(reprise = true)
+    }
+
+    /** Applique tout de suite un changement de contenu, selon où en est la soirée. */
+    fun appliquerReglages() {
+        when (etape) {
+            Etape.Echauffement, Etape.Pepite, Etape.Portes -> lancerRegenLot(reprise = false)
+            Etape.Fil -> {
+                val porte = porteFil
+                val gardes = conceptCourant + 1
+                if (porte != null && !lotExemple && gardes < CONCEPTS_PAR_PORTE) {
+                    lancerSuite(porte, gardes)
+                } else {
+                    annonce = "C'est noté : ça vaudra pour le lot de demain."
+                }
+            }
+            Etape.Recap, Etape.DejaFini -> annonce = "C'est noté : ça vaudra pour le lot de demain."
+        }
+    }
+
+    val fermerReglages: (Profil?, Profil?) -> Unit = { avant, apres ->
+        reglages = false
+        if (apres != null && apres != avant) {
+            creusagesParSoir = apres.creusagesParSoir
+            soiree.creusagesParSoir = apres.creusagesParSoir
+            val contenu = avant != null && apres.contenuDiffere(avant)
+            journal.note("reglages_modifies", "contenu" to contenu)
+            portee.launch {
+                val ok = distant.enregistrerProfil(apres)
+                when {
+                    !ok -> annonce = "Pas de connexion : tes réglages partiront à la prochaine ouverture."
+                    contenu -> appliquerReglages()
+                }
+            }
         }
     }
 
@@ -148,46 +271,116 @@ fun ChevetApp(
                     },
                 )
 
-                Etape.Pepite -> EcranPepite(lot.pepite) { etape = Etape.Portes }
-
-                Etape.Portes -> EcranPortes(lot.portes, bandeau) { porte ->
-                    journal.note("porte_choisie", "porte" to porte.id)
-                    etape = Etape.Fil(porte)
+                Etape.Pepite -> {
+                    LaunchedEffect(Unit) { soiree.marquerPepiteVue() }
+                    EcranPepite(lot.pepite) { etape = Etape.Portes }
                 }
 
-                is Etape.Fil -> EcranFil(
-                    porte = e.porte,
-                    journal = journal,
-                    creusagesRestants = creusagesRestants,
-                    creuser = creuser,
-                    onCreuser = { creusagesRestants -= 1 },
-                    onPartager = onPartager,
-                    onProgres = { progresFil = it },
-                    onFin = {
-                        progression.marquerVus(e.porte.concepts)
-                        progression.marquerLotConsomme()
-                        onConceptsExplores(e.porte.concepts)
-                        conceptsDuSoir = e.porte.concepts
-                        journal.note("fil_termine", "porte" to e.porte.id)
-                        etape = Etape.Recap
-                    },
-                )
+                Etape.Portes -> EcranPortes(
+                    portes = lot.portes,
+                    bandeau = bandeau,
+                    preparation = (regen as? Regen.Lot)?.preparation,
+                ) { porte ->
+                    journal.note("porte_choisie", "porte" to porte.id)
+                    porteFil = porte
+                    conceptCourant = 0
+                    etape = Etape.Fil
+                }
+
+                Etape.Fil -> porteFil?.let { porte ->
+                    EcranFil(
+                        porte = porte,
+                        attente = (regen as? Regen.Suite)?.takeIf { it.porteId == porte.id },
+                        journal = journal,
+                        creusagesRestants = (creusagesParSoir - creusagesFaits).coerceAtLeast(0),
+                        creusagesParSoir = creusagesParSoir,
+                        creuser = { concept, question -> distant.creuser(concept, question) },
+                        onCreuser = { creusagesFaits += 1 },
+                        onPartager = onPartager,
+                        onProgres = { progresFil = it },
+                        onConcept = { conceptCourant = it },
+                        onLireAncienne = {
+                            journal.note("regeneration_annulee", "type" to "suite")
+                            tache?.cancel()
+                            regen = null
+                        },
+                        onFin = {
+                            progression.marquerVus(porte.concepts)
+                            progression.marquerLotConsomme()
+                            onConceptsExplores(porte.concepts)
+                            conceptsDuSoir = porte.concepts
+                            journal.note("fil_termine", "porte" to porte.id)
+                            etape = Etape.Recap
+                        },
+                    )
+                }
 
                 Etape.Recap -> EcranRecap(
                     concepts = conceptsDuSoir,
                     teaser = lot.teaserDemain,
                     totalTerrier = progression.nombreDeConcepts(),
                     onBonneNuit = direBonneNuit,
-                    onRejouer = rejouer,
                 )
 
                 Etape.DejaFini -> EcranDejaFini(
                     teaser = lot.teaserDemain,
                     totalTerrier = progression.nombreDeConcepts(),
                     onBonneNuit = direBonneNuit,
-                    onRejouer = rejouer,
                 )
             }
+        }
+
+        // Engrenage discret : les réglages s'ouvrent par-dessus la soirée, sans la perdre.
+        if (!reglages && !etoiles) {
+            IconButton(
+                onClick = {
+                    journal.note("reglages_ouverts")
+                    reglages = true
+                },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .systemBarsPadding()
+                    .padding(4.dp),
+            ) {
+                Icon(
+                    Icons.Filled.Settings,
+                    contentDescription = "Réglages",
+                    tint = Encre.copy(alpha = 0.35f),
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+
+        if (reglages) {
+            EcranReglages(
+                distant = distant,
+                soiree = soiree,
+                journal = journal,
+                etatLot = if (lotExemple) "lot d'exemple" else "serveur, ${lot.jour}",
+                onFermer = fermerReglages,
+                onRejouer = {
+                    reglages = false
+                    rejouer()
+                },
+                onRegenererLot = {
+                    reglages = false
+                    lancerRegenLot(reprise = false)
+                },
+                onAnnonce = { annonce = it },
+            )
+        }
+
+        annonce?.let { texte ->
+            Text(
+                texte,
+                color = Encre,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .systemBarsPadding()
+                    .padding(top = 56.dp, start = 24.dp, end = 24.dp)
+                    .background(Color(0xEE1A1630), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            )
         }
     }
 }
@@ -246,6 +439,8 @@ private fun EcranEchauffement(
     val dernier = index + 1 >= revisions.size
 
     Colonne {
+        // Place pour l'engrenage des réglages, en haut à droite.
+        Spacer(Modifier.height(40.dp))
         Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -325,11 +520,25 @@ private fun EcranPepite(pepite: Carte, onSuite: () -> Unit) {
 // ---------------------------------------------------------------- Portes
 
 @Composable
-private fun EcranPortes(portes: List<Porte>, bandeau: String?, onChoix: (Porte) -> Unit) {
+private fun EcranPortes(
+    portes: List<Porte>,
+    bandeau: String?,
+    preparation: Preparation?,
+    onChoix: (Porte) -> Unit,
+) {
     Colonne {
-        Spacer(Modifier.height(32.dp))
+        Spacer(Modifier.height(40.dp))
         if (bandeau != null) {
             Text(bandeau, color = EncreDouce.copy(alpha = 0.7f), fontSize = 12.sp)
+            Spacer(Modifier.height(12.dp))
+        }
+        if (preparation != null) {
+            Text(
+                "De nouvelles portes se préparent avec tes réglages (étape ${preparation.etape} sur ${preparation.total}). " +
+                    "Celles-ci restent ouvertes en attendant.",
+                color = EncreDouce.copy(alpha = 0.8f),
+                fontSize = 12.sp,
+            )
             Spacer(Modifier.height(12.dp))
         }
         Etiquette("Ce soir")
@@ -374,6 +583,9 @@ private sealed interface Page {
     data class Question(override val concept: Concept) : Page
     data class Texte(override val concept: Concept, val carte: Carte, val numero: Int) : Page
     data class ARetenir(override val concept: Concept) : Page
+
+    /** La suite se réécrit : page d'attente après le dernier concept gardé. */
+    data class Attente(override val concept: Concept) : Page
 }
 
 private enum class Action(val libelle: String, val icone: ImageVector, val code: String, val retour: String) {
@@ -390,43 +602,57 @@ private enum class Action(val libelle: String, val icone: ImageVector, val code:
 @Composable
 private fun EcranFil(
     porte: Porte,
+    attente: Regen.Suite?,
     journal: Journal,
     creusagesRestants: Int,
+    creusagesParSoir: Int,
     creuser: suspend (Concept, String) -> String,
     onCreuser: () -> Unit,
     onPartager: (String) -> Unit,
     onProgres: (Float) -> Unit,
+    onConcept: (Int) -> Unit,
+    onLireAncienne: () -> Unit,
     onFin: () -> Unit,
 ) {
-    val pages = remember(porte) {
-        porte.concepts.flatMap { c ->
+    // Pendant la réécriture de la suite, seuls les concepts gardés restent, suivis d'une page d'attente.
+    val pages = remember(porte, attente?.gardes) {
+        val concepts = if (attente != null) porte.concepts.take(attente.gardes) else porte.concepts
+        val base = concepts.flatMap { c ->
             listOf<Page>(Page.Question(c)) +
                 c.cartes.mapIndexed { i, carte -> Page.Texte(c, carte, i) } +
                 Page.ARetenir(c)
         }
+        if (attente != null && concepts.isNotEmpty()) base + Page.Attente(concepts.last()) else base
     }
+    val pagesActuelles by rememberUpdatedState(pages)
+    val porteActuelle by rememberUpdatedState(porte)
     val etatPager = rememberPagerState(pageCount = { pages.size })
     var message by remember { mutableStateOf<String?>(null) }
     var voletCreuser by remember { mutableStateOf(false) }
     val uri = LocalUriHandler.current
 
-    // Journal : temps passé sur chaque carte, et progression de la nuit.
+    // Journal : temps passé sur chaque carte, progression de la nuit et concept en cours.
     LaunchedEffect(etatPager) {
         var precedente = etatPager.currentPage
         var debut = System.currentTimeMillis()
         snapshotFlow { etatPager.currentPage }.collect { page ->
+            val liste = pagesActuelles
             val maintenant = System.currentTimeMillis()
-            if (page != precedente) {
+            if (page != precedente && precedente in liste.indices) {
                 journal.note(
                     "carte_vue",
-                    "concept" to pages[precedente].concept.id,
+                    "concept" to liste[precedente].concept.id,
                     "page" to precedente,
                     "duree_ms" to (maintenant - debut),
                 )
             }
             precedente = page
             debut = maintenant
-            onProgres((page + 1).toFloat() / pages.size)
+            onProgres((page + 1).toFloat() / liste.size.coerceAtLeast(1))
+            liste.getOrNull(page)?.let { p ->
+                val index = porteActuelle.concepts.indexOfFirst { it.id == p.concept.id }
+                if (index >= 0) onConcept(index)
+            }
         }
     }
 
@@ -437,17 +663,22 @@ private fun EcranFil(
         }
     }
 
-    val concept = pages[etatPager.currentPage].concept
+    val concept = pages[etatPager.currentPage.coerceIn(0, pages.lastIndex)].concept
 
     Column(Modifier.fillMaxSize().systemBarsPadding()) {
         Box(Modifier.weight(1f)) {
             VerticalPager(state = etatPager, modifier = Modifier.fillMaxSize()) { i ->
-                PageCarte(
-                    page = pages[i],
-                    estDerniere = i == pages.lastIndex,
-                    onFin = onFin,
-                    onSource = { url -> runCatching { uri.openUri(url) } },
-                )
+                val page = pages.getOrNull(i)
+                when {
+                    page == null -> {}
+                    page is Page.Attente -> PageAttente(porte.titre, attente?.preparation, onLireAncienne)
+                    else -> PageCarte(
+                        page = page,
+                        estDerniere = i == pages.lastIndex,
+                        onFin = onFin,
+                        onSource = { url -> runCatching { uri.openUri(url) } },
+                    )
+                }
             }
             message?.let { texte ->
                 Text(
@@ -479,6 +710,7 @@ private fun EcranFil(
             VoletCreuser(
                 concept = concept,
                 restants = creusagesRestants,
+                parSoir = creusagesParSoir,
                 creuser = creuser,
                 onCreuser = { question ->
                     journal.note("creuser_question", "concept" to concept.id, "question" to question)
@@ -524,6 +756,8 @@ private fun PageCarte(page: Page, estDerniere: Boolean, onFin: () -> Unit, onSou
                     Spacer(Modifier.height(12.dp))
                     Text(page.carte.texte, color = Encre, style = MaterialTheme.typography.titleLarge)
                 }
+
+                is Page.Attente -> Unit
 
                 is Page.ARetenir -> {
                     if (c.aRetenir.isNotBlank()) {
@@ -578,6 +812,40 @@ private fun PageCarte(page: Page, estDerniere: Boolean, onFin: () -> Unit, onSou
 }
 
 @Composable
+private fun PageAttente(titrePorte: String, preparation: Preparation?, onLireAncienne: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp, vertical = 24.dp),
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Panneau {
+            Etiquette("La suite se réécrit")
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Le conteur réécrit la suite de « $titrePorte » avec tes nouveaux réglages.",
+                color = Encre,
+                style = MaterialTheme.typography.titleLarge,
+            )
+            Spacer(Modifier.height(20.dp))
+            val p = preparation ?: Preparation(0, 4)
+            LinearProgressIndicator(
+                progress = { p.etape.toFloat() / p.total.coerceAtLeast(1) },
+                modifier = Modifier.fillMaxWidth(),
+                color = Ambre,
+                trackColor = Voile,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("Étape ${p.etape} sur ${p.total}", color = EncreDouce, style = MaterialTheme.typography.bodyMedium)
+        }
+        Spacer(Modifier.height(20.dp))
+        OutlinedButton(onClick = onLireAncienne, modifier = Modifier.fillMaxWidth()) {
+            Text("Lire l'ancienne version", color = Encre)
+        }
+    }
+}
+
+@Composable
 private fun BarreActions(onAction: (Action) -> Unit) {
     Row(
         Modifier
@@ -604,6 +872,7 @@ private fun BarreActions(onAction: (Action) -> Unit) {
 private fun VoletCreuser(
     concept: Concept,
     restants: Int,
+    parSoir: Int,
     creuser: suspend (Concept, String) -> String,
     onCreuser: (String) -> Unit,
     onFermer: () -> Unit,
@@ -620,7 +889,7 @@ private fun VoletCreuser(
             .navigationBarsPadding()
             .verticalScroll(rememberScrollState()),
     ) {
-        Etiquette("Creuser · $restants/3 ce soir")
+        Etiquette("Creuser · $restants/$parSoir ce soir")
         Spacer(Modifier.height(12.dp))
         val choisie = question
         when {
@@ -673,7 +942,6 @@ private fun EcranRecap(
     teaser: String,
     totalTerrier: Int,
     onBonneNuit: () -> Unit,
-    onRejouer: () -> Unit,
 ) {
     Colonne {
         Spacer(Modifier.height(32.dp))
@@ -687,12 +955,12 @@ private fun EcranRecap(
                 modifier = Modifier.padding(vertical = 4.dp),
             )
         }
-        FinDeSoiree(teaser, totalTerrier, onBonneNuit, onRejouer)
+        FinDeSoiree(teaser, totalTerrier, onBonneNuit)
     }
 }
 
 @Composable
-private fun EcranDejaFini(teaser: String, totalTerrier: Int, onBonneNuit: () -> Unit, onRejouer: () -> Unit) {
+private fun EcranDejaFini(teaser: String, totalTerrier: Int, onBonneNuit: () -> Unit) {
     Colonne {
         Spacer(Modifier.height(32.dp))
         Etiquette("C'est tout pour aujourd'hui")
@@ -702,12 +970,12 @@ private fun EcranDejaFini(teaser: String, totalTerrier: Int, onBonneNuit: () -> 
             color = Encre,
             style = MaterialTheme.typography.bodyLarge,
         )
-        FinDeSoiree(teaser, totalTerrier, onBonneNuit, onRejouer)
+        FinDeSoiree(teaser, totalTerrier, onBonneNuit)
     }
 }
 
 @Composable
-private fun ColumnScope.FinDeSoiree(teaser: String, totalTerrier: Int, onBonneNuit: () -> Unit, onRejouer: () -> Unit) {
+private fun ColumnScope.FinDeSoiree(teaser: String, totalTerrier: Int, onBonneNuit: () -> Unit) {
     Spacer(Modifier.height(24.dp))
     Etiquette("Demain")
     Spacer(Modifier.height(6.dp))
@@ -719,7 +987,4 @@ private fun ColumnScope.FinDeSoiree(teaser: String, totalTerrier: Int, onBonneNu
     )
     Spacer(Modifier.height(32.dp))
     Button(onClick = onBonneNuit, modifier = Modifier.fillMaxWidth()) { Text("Bonne nuit") }
-    TextButton(onClick = onRejouer, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-        Text("Rejouer (test)", color = EncreDouce.copy(alpha = 0.6f))
-    }
 }
