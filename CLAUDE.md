@@ -6,3 +6,5 @@
 - Garder la même clé `app/debug.keystore` pour que les mises à jour s'installent par-dessus.
 - IA : Groq (gpt-oss-120b pour le lot, gpt-oss-20b pour « creuser »), appelée uniquement depuis des fonctions Supabase ; la clé ne doit jamais être dans l'APK.
 - Principes produit à respecter : fil borné, zéro dette, aucune culpabilisation, cartes d'environ 40 mots, ton de conteur.
+- Serveur : projet Supabase « Panier » (ref iolmjlqcvipzsihvrxlj), partagé avec d'autres applis de Damien. Ne toucher qu'aux tables `chevet_*` et aux fonctions `chevet-*`.
+- Le dépôt est public : jamais de profil personnel, de clé secrète ni de donnée privée dans le code. Le profil vit dans `chevet_profil`.

@@ -14,6 +14,7 @@ class Journal(context: Context) {
 
     private val fichier = File(context.filesDir, "journal.jsonl")
 
+    @Synchronized
     fun note(evenement: String, vararg details: Pair<String, Any?>) {
         val ligne = buildJsonObject {
             put("horodatage", Instant.now().toString())
@@ -28,5 +29,17 @@ class Journal(context: Context) {
             }
         }
         runCatching { fichier.appendText(ligne.toString() + "\n") }
+    }
+
+    /** Les lignes pas encore envoyées à Supabase. */
+    @Synchronized
+    fun lignes(): List<String> =
+        if (fichier.exists()) fichier.readLines().filter { it.isNotBlank() } else emptyList()
+
+    /** Retire les [n] premières lignes, une fois envoyées. */
+    @Synchronized
+    fun oublier(n: Int) {
+        val restantes = lignes().drop(n)
+        fichier.writeText(if (restantes.isEmpty()) "" else restantes.joinToString("\n", postfix = "\n"))
     }
 }

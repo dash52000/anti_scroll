@@ -1,57 +1,74 @@
--- Chevet : schéma initial (spec V1, section « Données et journal d'utilisation »).
--- Chaque ligne appartient à un utilisateur ; la RLS limite l'accès à ses propres lignes.
--- Les fonctions serveur (génération du lot, creuser) utilisent la clé service et passent outre la RLS.
+-- Chevet : schéma (spec V1, section « Données et journal d'utilisation »).
+-- Hébergé dans le projet Supabase « Panier » : toutes les tables sont préfixées chevet_.
+-- RLS : chaque utilisateur ne voit que ses lignes. Les fonctions serveur (chevet-lot,
+-- chevet-creuser) utilisent la clé service et passent outre la RLS.
+-- Les lignes sans user_id (profil modèle, lot de test) sont invisibles pour les clients.
 
--- Profil : intérêts, niveaux, poids des thèmes, style, déclencheur, heure de coucher apprise.
-create table public.profil (
-  user_id uuid primary key default auth.uid() references auth.users on delete cascade,
+create extension if not exists pg_net;
+create extension if not exists pg_cron;
+
+-- Profil : intérêts, niveaux, style, sources, graines du premier soir.
+create table public.chevet_profil (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid unique references auth.users on delete cascade,
   interets jsonb not null default '{}'::jsonb,
   niveaux jsonb not null default '{}'::jsonb,
-  poids_themes jsonb not null default '{}'::jsonb,
   style jsonb not null default '{}'::jsonb,
   a_eviter text[] not null default '{}',
+  graines jsonb not null default '[]'::jsonb,
+  sources_rss jsonb not null default '[]'::jsonb,
   declencheur text,
   heure_coucher time not null default '22:30',
   mis_a_jour_le timestamptz not null default now()
 );
 
 -- Concepts : les nœuds du terrier.
-create table public.concepts (
+create table public.chevet_concepts (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null default auth.uid() references auth.users on delete cascade,
+  user_id uuid references auth.users on delete cascade,
+  slug text not null,
   titre text not null,
   theme text not null,
   wikipedia_url text,
   a_retenir text,
   a_raconter text,
   qcm jsonb,
+  lot_jour date,
   decouvert_le timestamptz not null default now(),
-  unique (user_id, wikipedia_url)
+  unique (user_id, slug)
 );
 
 -- Liens : les arêtes du graphe entre concepts.
-create table public.liens (
-  user_id uuid not null default auth.uid() references auth.users on delete cascade,
-  source_id uuid not null references public.concepts on delete cascade,
-  cible_id uuid not null references public.concepts on delete cascade,
+create table public.chevet_liens (
+  user_id uuid references auth.users on delete cascade,
+  source_id uuid not null references public.chevet_concepts on delete cascade,
+  cible_id uuid not null references public.chevet_concepts on delete cascade,
   primary key (source_id, cible_id)
 );
 
--- Lots : un lot par jour, généré le matin, remplacé le lendemain.
-create table public.lots (
+-- Lots : un lot par jour, préparé le matin étape par étape, remplacé le lendemain.
+create table public.chevet_lots (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null default auth.uid() references auth.users on delete cascade,
+  user_id uuid references auth.users on delete cascade,
   jour date not null,
-  contenu jsonb not null,
+  statut text not null default 'composition'
+    check (statut in ('composition', 'en_cours', 'pret', 'erreur')),
+  etape int not null default 0,
+  contenu jsonb not null default '{}'::jsonb,
+  travail jsonb not null default '{}'::jsonb,
+  erreur text,
   genere_le timestamptz not null default now(),
+  pret_le timestamptz,
   consomme_le timestamptz,
-  unique (user_id, jour)
+  -- Verrou court pendant qu'une étape de génération tourne.
+  verrou_jusqua timestamptz
 );
+create unique index chevet_lots_user_jour on public.chevet_lots (user_id, jour) nulls not distinct;
 
 -- Révisions : état de répétition espacée par concept.
-create table public.revisions (
-  user_id uuid not null default auth.uid() references auth.users on delete cascade,
-  concept_id uuid not null references public.concepts on delete cascade,
+create table public.chevet_revisions (
+  user_id uuid not null references auth.users on delete cascade,
+  concept_id uuid not null references public.chevet_concepts on delete cascade,
   intervalle_jours int not null default 1,
   echeance date not null default (current_date + 1),
   repetitions int not null default 0,
@@ -59,7 +76,7 @@ create table public.revisions (
 );
 
 -- Boîte à curiosités : partages et saisies de la journée.
-create table public.curiosites (
+create table public.chevet_curiosites (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null default auth.uid() references auth.users on delete cascade,
   texte text,
@@ -71,7 +88,7 @@ create table public.curiosites (
 );
 
 -- Journal d'utilisation : jamais affiché dans l'appli, analysé en R.
-create table public.journal (
+create table public.chevet_journal (
   id bigint generated always as identity primary key,
   user_id uuid not null default auth.uid() references auth.users on delete cascade,
   horodatage timestamptz not null default now(),
@@ -82,10 +99,10 @@ create table public.journal (
   duree_ms int,
   donnees jsonb not null default '{}'::jsonb
 );
-create index journal_user_horodatage on public.journal (user_id, horodatage);
+create index chevet_journal_user_horodatage on public.chevet_journal (user_id, horodatage);
 
 -- Check-in du dimanche.
-create table public.checkins (
+create table public.chevet_checkins (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null default auth.uid() references auth.users on delete cascade,
   semaine date not null,
@@ -100,11 +117,14 @@ do $$
 declare
   t text;
 begin
-  foreach t in array array['profil', 'concepts', 'liens', 'lots', 'revisions', 'curiosites', 'journal', 'checkins']
+  foreach t in array array[
+    'chevet_profil', 'chevet_concepts', 'chevet_liens', 'chevet_lots',
+    'chevet_revisions', 'chevet_curiosites', 'chevet_journal', 'chevet_checkins'
+  ]
   loop
     execute format('alter table public.%I enable row level security', t);
     execute format(
-      'create policy proprietaire on public.%I for all to authenticated '
+      'create policy chevet_proprietaire on public.%I for all to authenticated '
       'using (user_id = (select auth.uid())) with check (user_id = (select auth.uid()))',
       t
     );

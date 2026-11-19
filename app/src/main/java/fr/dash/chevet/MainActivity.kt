@@ -5,11 +5,12 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
 import fr.dash.chevet.data.LotExemple
 import fr.dash.chevet.data.Progression
-import fr.dash.chevet.ui.ChevetApp
 import fr.dash.chevet.ui.ChevetTheme
+import fr.dash.chevet.ui.Racine
 import java.time.LocalTime
 
 class MainActivity : ComponentActivity() {
@@ -19,20 +20,21 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         baisserLuminositeLeSoir()
 
-        val lot = LotExemple(this).lotDuJour()
         val progression = Progression(this)
         val journal = Journal(this)
-        journal.note("ouverture", "lot" to lot.jour)
+        val distant = Distant(this)
+        journal.note("ouverture")
 
         setContent {
             ChevetTheme {
-                ChevetApp(
-                    lot = lot,
+                Racine(
+                    distant = distant,
                     progression = progression,
                     journal = journal,
+                    lotExemple = { LotExemple(this).lotDuJour() },
                     onPartager = ::partager,
                     onRejouer = { recreate() },
-                    onBonneNuit = { finish() },
+                    onFermer = { finish() },
                 )
             }
         }

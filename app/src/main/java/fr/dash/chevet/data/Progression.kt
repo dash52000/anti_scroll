@@ -36,7 +36,10 @@ class Progression(context: Context) {
 
     /** Les révisions dues aujourd'hui, 5 au maximum. */
     fun revisionsDues(aujourdhui: LocalDate = LocalDate.now()): List<ConceptVu> =
-        lire().filter { !LocalDate.parse(it.echeance).isAfter(aujourdhui) }.take(5)
+        lire()
+            .filter { !LocalDate.parse(it.echeance).isAfter(aujourdhui) }
+            .filter { it.concept.qcm.choix.size >= 2 && it.concept.qcm.bonne in it.concept.qcm.choix.indices }
+            .take(5)
 
     fun marquerVus(concepts: List<Concept>, aujourdhui: LocalDate = LocalDate.now()) {
         val parId = lire().associateBy { it.concept.id }.toMutableMap()

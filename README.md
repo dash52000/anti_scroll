@@ -18,17 +18,25 @@ donc une nouvelle version s'installe par-dessus l'ancienne sans désinstaller.
 
 | Brique | État |
 | --- | --- |
-| Rituel du soir (échauffement, pépite, portes, fil, récap, bonne nuit) | Squelette fonctionnel, lot d'exemple local |
+| Rituel du soir (échauffement, pépite, portes, fil, récap, bonne nuit) | Fait |
 | Ciel du soir qui s'assombrit, étoiles au « bonne nuit » | Fait (dessiné par le code) |
-| Journal d'utilisation | Local (`journal.jsonl`), synchro Supabase à venir |
+| Lot du jour généré par Groq (fonction `chevet-lot`, préparé chaque matin par pg_cron) | Fait, lot d'exemple en secours |
+| Creuser (fonction `chevet-creuser`, gpt-oss-20b, 3 par soir) | Fait |
+| Connexion | Anonyme et automatique au premier lancement |
+| Journal d'utilisation | Local puis envoyé dans `chevet_journal` |
+| Terrier | Concepts explorés envoyés dans `chevet_concepts` |
 | Répétition espacée des QCM | Locale |
-| Schéma Supabase | `supabase/migrations/` (pas encore appliqué) |
-| Génération du lot (Groq via fonction Supabase) | À faire |
-| Creuser (Groq) | Interface prête, branchement à faire |
 | Notification du soir, onboarding, carnet, graphe du terrier | À faire |
 
 Reporté en V2 : banque d'images de paysages, météo, version courte automatique, photo
 dans la boîte à curiosités.
+
+## Côté serveur
+
+Chevet est hébergé dans le projet Supabase **Panier** : tables préfixées `chevet_`,
+fonctions `chevet-lot` et `chevet-creuser`. La clé Groq est un secret de fonction
+(`CHEVET_GROQ_API_KEY`), jamais dans l'APK. Le profil du lecteur vit dans la table
+`chevet_profil`, pas dans ce dépôt.
 
 ## Structure
 
@@ -36,10 +44,11 @@ dans la boîte à curiosités.
 app/src/main/java/fr/dash/chevet/
   MainActivity.kt          point d'entrée, luminosité du soir, partage
   model/Lot.kt             modèle du lot du jour (portes, concepts, cartes, QCM)
-  data/                    lot d'exemple, journal, progression (révisions)
+  data/                    Supabase, lot d'exemple, journal, progression (révisions)
   ui/                      ciel, écrans du rituel, thème
 app/src/main/assets/lot_exemple.json   le best of du premier soir
-supabase/migrations/       schéma de la base
+supabase/migrations/       schéma de la base et tâche du matin
+supabase/functions/        génération du lot et « creuser »
 .github/workflows/build.yml            build de l'APK
 ```
 
