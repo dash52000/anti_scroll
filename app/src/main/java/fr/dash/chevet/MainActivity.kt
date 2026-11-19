@@ -9,6 +9,7 @@ import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
 import fr.dash.chevet.data.LotExemple
 import fr.dash.chevet.data.Progression
+import fr.dash.chevet.data.Soiree
 import fr.dash.chevet.ui.ChevetTheme
 import fr.dash.chevet.ui.Racine
 import java.time.LocalTime
@@ -23,7 +24,13 @@ class MainActivity : ComponentActivity() {
         val progression = Progression(this)
         val journal = Journal(this)
         val distant = Distant(this)
+        val soiree = Soiree(this)
         journal.note("ouverture")
+
+        // L'heure de coucher s'apprend sur les ouvertures du soir ; la notif suit.
+        soiree.noterOuverture()
+        Rappel.creerCanal(this)
+        Rappel.programmer(this)
 
         setContent {
             ChevetTheme {
@@ -31,6 +38,7 @@ class MainActivity : ComponentActivity() {
                     distant = distant,
                     progression = progression,
                     journal = journal,
+                    soiree = soiree,
                     lotExemple = { LotExemple(this).lotDuJour() },
                     onPartager = ::partager,
                     onRejouer = { recreate() },

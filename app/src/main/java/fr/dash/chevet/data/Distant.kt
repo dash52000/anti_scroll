@@ -3,12 +3,16 @@ package fr.dash.chevet.data
 import android.content.Context
 import fr.dash.chevet.model.Concept
 import fr.dash.chevet.model.Lot
+import fr.dash.chevet.model.Porte
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -22,7 +26,11 @@ import kotlinx.serialization.json.put
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 /**
  * Accès à Supabase (projet partagé « Panier », tables chevet_*).
@@ -39,11 +47,31 @@ data class Preparation(val etape: Int, val total: Int)
 /** D'où vient le lot affiché ce soir. */
 data class LotCharge(val lot: Lot, val exemple: Boolean, val message: String? = null)
 
+/** Résultat du test d'une nouvelle source d'actu. */
+@Serializable
+data class ResultatFlux(
+    val ok: Boolean = false,
+    val nom: String? = null,
+    val url: String? = null,
+    val articles: Int = 0,
+    val dernier: String? = null,
+    val erreur: String? = null,
+)
+
+private const val FONCTION_LOT = "/functions/v1/chevet-lot"
+
 class Distant(context: Context) {
 
     private val prefs = context.getSharedPreferences("session", Context.MODE_PRIVATE)
     private val dossier = context.filesDir
     private val json = Json { ignoreUnknownKeys = true }
+
+    /** Pour le profil : les champs absents ou nuls prennent leur valeur par défaut. */
+    private val souple = Json {
+        ignoreUnknownKeys = true
+        coerceInputValues = true
+        encodeDefaults = true
+    }
 
     // ------------------------------------------------------------ HTTP
 
@@ -133,46 +161,230 @@ class Distant(context: Context) {
      */
     suspend fun lotDuJour(exemple: () -> Lot, onPreparation: (Preparation) -> Unit): LotCharge =
         withContext(Dispatchers.IO) {
-            val jour = LocalDate.now()
-            val enCache = cache(jour)
-            if (enCache.exists()) {
-                runCatching { json.decodeFromString(Lot.serializer(), enCache.readText()) }
-                    .getOrNull()?.let { return@withContext LotCharge(it, exemple = false) }
-            }
-
-            var dernierMessage: String? = null
+            lotEnCache()?.let { return@withContext LotCharge(it, exemple = false) }
             try {
-                repeat(16) {
-                    val (code, texte) = requete("POST", "/functions/v1/chevet-lot", """{"action":"avancer"}""", jeton())
-                    val o = objet(texte) ?: error("Réponse illisible ($code)")
-                    dernierMessage = o["erreur"]?.jsonPrimitive?.contentOrNull
-                    val statut = o["statut"]?.jsonPrimitive?.contentOrNull
-                    val etape = o["etape"]?.jsonPrimitive?.intOrNull ?: 0
-                    val total = o["total"]?.jsonPrimitive?.intOrNull ?: 8
-                    withContext(Dispatchers.Main) { onPreparation(Preparation(etape, total)) }
-
-                    when (statut) {
-                        "pret" -> {
-                            val brut = o["lot"] ?: error("Lot vide")
-                            val lot = json.decodeFromJsonElement(Lot.serializer(), brut)
-                            if (lot.portes.isEmpty()) error("Lot sans porte")
-                            enCache.writeText(json.encodeToString(Lot.serializer(), lot))
-                            nettoyerVieuxCaches(jour)
-                            return@withContext LotCharge(lot, exemple = false)
-                        }
-                        "erreur" -> error(dernierMessage ?: "Préparation en erreur")
-                    }
-                    // Étape occupée ou limite Groq : on souffle un peu avant de relancer.
-                    if (o["occupe"] != null || dernierMessage != null) delay(15_000)
-                }
+                LotCharge(preparer(dureeMax = 12 * 60_000L, onPreparation), exemple = false)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: LotLent) {
                 LotCharge(exemple(), exemple = true, message = "Le lot met du temps à se préparer : voici le lot d'exemple.")
             } catch (e: Exception) {
-                LotCharge(exemple(), exemple = true, message = "Lot d'exemple : ${dernierMessage ?: e.message}")
+                LotCharge(exemple(), exemple = true, message = "Lot d'exemple : ${e.message}")
             }
         }
 
+    private class LotLent : Exception("Préparation trop longue")
+
+    private class LotEnErreur(message: String) : Exception(message)
+
+    private fun lotEnCache(jour: LocalDate = LocalDate.now()): Lot? {
+        val enCache = cache(jour)
+        if (!enCache.exists()) return null
+        return runCatching { json.decodeFromString(Lot.serializer(), enCache.readText()) }.getOrNull()
+    }
+
+    /**
+     * Fait avancer la préparation du lot côté serveur jusqu'à ce qu'il soit prêt, puis le met en cache.
+     * Le cache précédent n'est remplacé qu'à la fin : en cas d'échec, l'ancien lot reste.
+     */
+    private suspend fun preparer(dureeMax: Long, onPreparation: (Preparation) -> Unit): Lot {
+        val jour = LocalDate.now()
+        val debut = System.currentTimeMillis()
+        var dernierMessage: String? = null
+        while (System.currentTimeMillis() - debut < dureeMax) {
+            val (code, texte) = requete("POST", FONCTION_LOT, """{"action":"avancer"}""", jeton())
+            val o = objet(texte) ?: error("Réponse illisible ($code)")
+            dernierMessage = o["erreur"]?.jsonPrimitive?.contentOrNull
+            val statut = o["statut"]?.jsonPrimitive?.contentOrNull
+            val etape = o["etape"]?.jsonPrimitive?.intOrNull ?: 0
+            val total = o["total"]?.jsonPrimitive?.intOrNull ?: 8
+            withContext(Dispatchers.Main) { onPreparation(Preparation(etape, total)) }
+
+            when (statut) {
+                "pret" -> {
+                    val brut = o["lot"] ?: error("Lot vide")
+                    val lot = json.decodeFromJsonElement(Lot.serializer(), brut)
+                    if (lot.portes.isEmpty()) error("Lot sans porte")
+                    cache(jour).writeText(json.encodeToString(Lot.serializer(), lot))
+                    nettoyerVieuxCaches(jour)
+                    prefs.edit().remove(CLE_REGENERATION).apply()
+                    return lot
+                }
+                "erreur" -> throw LotEnErreur(dernierMessage ?: "Préparation en erreur")
+            }
+            // Étape occupée ou limite Groq : on souffle un peu avant de relancer.
+            if (o["occupe"] != null || dernierMessage != null) delay(15_000)
+        }
+        throw LotLent()
+    }
+
     private fun nettoyerVieuxCaches(jour: LocalDate) {
         dossier.listFiles { f -> f.name.startsWith("lot_") && f.name != "lot_$jour.json" }?.forEach { it.delete() }
+    }
+
+    // ------------------------------------------------------------ Régénération (réglages)
+
+    /** Vrai si une régénération du lot du jour a été lancée et n'a pas encore abouti. */
+    fun regenerationEnCours(): Boolean = prefs.getString(CLE_REGENERATION, null) == LocalDate.now().toString()
+
+    /**
+     * Recompose tout le lot du jour avec le profil à jour, en arrière-plan.
+     * [reprise] : la remise à zéro a déjà été faite, on reprend juste la préparation.
+     * Renvoie le nouveau lot, ou null en cas d'échec (l'ancien reste en cache).
+     */
+    suspend fun regenererLot(reprise: Boolean, onPreparation: (Preparation) -> Unit): Lot? =
+        withContext(Dispatchers.IO) {
+            try {
+                if (!reprise) {
+                    val (code, _) = requete("POST", FONCTION_LOT, """{"action":"regenerer"}""", jeton())
+                    check(code in 200..299) { "Remise à zéro impossible ($code)" }
+                    prefs.edit().putString(CLE_REGENERATION, LocalDate.now().toString()).apply()
+                }
+                preparer(dureeMax = 15 * 60_000L, onPreparation)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: LotEnErreur) {
+                prefs.edit().remove(CLE_REGENERATION).apply()
+                null
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+    /**
+     * Réécrit les concepts d'une porte après les [gardes] premiers, en arrière-plan.
+     * Renvoie la porte complétée (et met le cache à jour), ou null si la suite n'a pas pu être écrite.
+     */
+    suspend fun suite(
+        porteId: String,
+        gardes: Int,
+        demande: String,
+        onEtape: (Preparation) -> Unit,
+    ): Porte? = withContext(Dispatchers.IO) {
+        try {
+            val debut = System.currentTimeMillis()
+            while (System.currentTimeMillis() - debut < 8 * 60_000L) {
+                val corps = buildJsonObject {
+                    put("action", "suite")
+                    put("porte", porteId)
+                    put("gardes", gardes)
+                    put("demande", demande)
+                }.toString()
+                val (code, texte) = requete("POST", FONCTION_LOT, corps, jeton())
+                val o = objet(texte) ?: error("Réponse illisible ($code)")
+                val etape = o["etape"]?.jsonPrimitive?.intOrNull ?: 0
+                val total = o["total"]?.jsonPrimitive?.intOrNull ?: 4
+                withContext(Dispatchers.Main) { onEtape(Preparation(etape, total)) }
+                when (o["statut"]?.jsonPrimitive?.contentOrNull) {
+                    "pret" -> {
+                        val brut = o["porte"] ?: return@withContext null
+                        val porte = json.decodeFromJsonElement(Porte.serializer(), brut)
+                        remplacerPorteEnCache(porte)
+                        return@withContext porte
+                    }
+                    "en_cours" -> {
+                        val souffle = o["occupe"] != null || o["erreur"]?.jsonPrimitive?.contentOrNull != null
+                        if (souffle) delay(15_000)
+                    }
+                    else -> return@withContext null
+                }
+            }
+            null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun remplacerPorteEnCache(porte: Porte) {
+        val jour = LocalDate.now()
+        val lot = lotEnCache(jour) ?: return
+        val nouveau = lot.copy(portes = lot.portes.map { if (it.id == porte.id) porte else it })
+        cache(jour).writeText(json.encodeToString(Lot.serializer(), nouveau))
+    }
+
+    // ------------------------------------------------------------ Profil (réglages)
+
+    fun profilEnCache(): Profil? =
+        prefs.getString(CLE_PROFIL, null)?.let { runCatching { souple.decodeFromString(Profil.serializer(), it) }.getOrNull() }
+
+    /** Le profil réglable depuis le serveur, sinon la dernière copie connue. */
+    suspend fun profil(): Profil? = withContext(Dispatchers.IO) {
+        try {
+            val (code, texte) = requete("POST", FONCTION_LOT, """{"action":"profil"}""", jeton())
+            val brut = objet(texte)?.get("profil")
+            if (code in 200..299 && brut is JsonObject) {
+                val profil = souple.decodeFromJsonElement(Profil.serializer(), brut)
+                prefs.edit().putString(CLE_PROFIL, souple.encodeToString(Profil.serializer(), profil)).apply()
+                return@withContext profil
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // hors ligne : copie locale
+        }
+        profilEnCache()
+    }
+
+    /** Enregistre le profil. Hors ligne, il est gardé et renvoyé à la prochaine ouverture. */
+    suspend fun enregistrerProfil(profil: Profil): Boolean = withContext(Dispatchers.IO) {
+        val texte = souple.encodeToString(Profil.serializer(), profil)
+        val ok = try {
+            envoyerProfil(profil)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
+        prefs.edit().apply {
+            if (ok) {
+                putString(CLE_PROFIL, texte)
+                remove(CLE_PROFIL_EN_ATTENTE)
+            } else {
+                putString(CLE_PROFIL_EN_ATTENTE, texte)
+            }
+        }.apply()
+        ok
+    }
+
+    fun profilEnAttente(): Boolean = prefs.contains(CLE_PROFIL_EN_ATTENTE)
+
+    suspend fun renvoyerProfilEnAttente() {
+        val texte = prefs.getString(CLE_PROFIL_EN_ATTENTE, null) ?: return
+        val profil = runCatching { souple.decodeFromString(Profil.serializer(), texte) }.getOrNull()
+        if (profil == null) {
+            prefs.edit().remove(CLE_PROFIL_EN_ATTENTE).apply()
+            return
+        }
+        enregistrerProfil(profil)
+    }
+
+    /** L'écriture passe par la fonction serveur, qui borne et nettoie chaque champ. */
+    private fun envoyerProfil(profil: Profil): Boolean {
+        val champs = souple.encodeToJsonElement(Profil.serializer(), profil).jsonObject
+        val corps = buildJsonObject {
+            put("action", "enregistrer_profil")
+            put("profil", JsonObject(champs.filterValues { it !is JsonNull }))
+        }
+        val (code, _) = requete("POST", FONCTION_LOT, corps.toString(), jeton())
+        return code in 200..299
+    }
+
+    /** Vérifie côté serveur qu'une URL donne un flux RSS lisible. */
+    suspend fun testerFlux(url: String): ResultatFlux = withContext(Dispatchers.IO) {
+        try {
+            val corps = buildJsonObject {
+                put("action", "tester_flux")
+                put("url", url)
+            }.toString()
+            val (_, texte) = requete("POST", FONCTION_LOT, corps, jeton())
+            json.decodeFromString(ResultatFlux.serializer(), texte)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            ResultatFlux(ok = false, erreur = "Pas de connexion")
+        }
     }
 
     // ------------------------------------------------------------ Creuser
@@ -248,7 +460,37 @@ class Distant(context: Context) {
                 mapOf("Prefer" to "return=minimal"),
             )
             if (code in 200..299) journal.oublier(lignes.size)
+            val heure = LocalDateTime.now().format(DateTimeFormatter.ofPattern("dd/MM HH:mm"))
+            prefs.edit().putString(CLE_DERNIER_ENVOI, "$heure · ${lignes.size} ligne(s) · code $code").apply()
         }
+    }
+
+    // ------------------------------------------------------------ Outils de test
+
+    /** État de la synchro Supabase, pour les outils de test. */
+    fun etatSynchro(journal: Journal): List<Pair<String, String>> {
+        val expire = prefs.getLong("expire", 0)
+        val finJeton = if (expire > 0) {
+            Instant.ofEpochSecond(expire).atZone(ZoneId.systemDefault())
+                .format(DateTimeFormatter.ofPattern("dd/MM HH:mm"))
+        } else {
+            "aucun"
+        }
+        return listOf(
+            "Utilisateur" to (utilisateur()?.take(8)?.let { "$it…" } ?: "aucun"),
+            "Jeton valide jusqu'au" to finJeton,
+            "Journal en attente" to "${journal.lignes().size} ligne(s)",
+            "Dernier envoi du journal" to (prefs.getString(CLE_DERNIER_ENVOI, null) ?: "jamais"),
+            "Profil en attente d'envoi" to if (profilEnAttente()) "oui" else "non",
+            "Régénération du lot" to if (regenerationEnCours()) "en cours" else "aucune",
+        )
+    }
+
+    private companion object {
+        const val CLE_REGENERATION = "regeneration"
+        const val CLE_PROFIL = "profil"
+        const val CLE_PROFIL_EN_ATTENTE = "profil_en_attente"
+        const val CLE_DERNIER_ENVOI = "dernier_envoi_journal"
     }
 
     private fun versRang(o: JsonObject, uid: String): JsonObject {
