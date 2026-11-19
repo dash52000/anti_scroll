@@ -1,9 +1,11 @@
--- Chevet : préparation du lot du matin.
--- Toutes les 5 minutes entre 4 h et 6 h 55 UTC (5 h à 7 h 55 à Paris en hiver), la fonction
--- chevet-lot fait avancer d'une étape le lot de chaque utilisateur. Un lot prêt ne bouge plus.
+-- Chevet : préparation du lot du jour.
+-- Toutes les 5 minutes entre 4 h et 20 h 55 UTC (5 h à 21 h 55 à Paris en hiver), la fonction
+-- chevet-lot fait avancer d'une étape le lot de chaque utilisateur. Le matin, le lot est prêt
+-- avant le réveil ; dans la journée, un lot commencé à l'ouverture de l'appli se termine seul.
+-- Un lot prêt ne bouge plus, donc les appels suivants ne coûtent rien.
 -- La clé utilisée est la clé publique (anon) : la fonction est idempotente, un appel en trop ne coûte rien.
 
-select cron.schedule('chevet-lot-matin', '*/5 4-6 * * *', $cron$
+select cron.schedule('chevet-lot-matin', '*/5 4-20 * * *', $cron$
   select net.http_post(
     url := 'https://iolmjlqcvipzsihvrxlj.supabase.co/functions/v1/chevet-lot',
     headers := jsonb_build_object(

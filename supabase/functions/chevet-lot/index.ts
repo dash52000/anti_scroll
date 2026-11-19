@@ -174,30 +174,90 @@ async function wiki(params: Record<string, string>, langue: string): Promise<Jso
 const urlArticle = (titre: string, langue: string) =>
   `https://${langue}.wikipedia.org/wiki/${encodeURIComponent(titre.replaceAll(" ", "_"))}`;
 
-async function resoudreArticle(titre: string) {
-  for (const langue of ["fr", "en"]) {
+async function titreExact(titre: string, langue: string) {
+  const d = await wiki({ action: "query", titles: titre, redirects: "1", prop: "pageprops" }, langue);
+  const page = d.query?.pages?.[0];
+  if (page && !page.missing && !page.invalid && !page.pageprops?.disambiguation) {
+    return { titre: page.title as string, langue, url: urlArticle(page.title, langue) };
+  }
+  return null;
+}
+
+function motsSignificatifs(texte: string): Set<string> {
+  return new Set(
+    texte.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+      .split(/[^a-z0-9]+/).filter((m) => m.length > 3),
+  );
+}
+
+/** Proportion des mots du titre demandé qu'on retrouve dans le titre trouvé. */
+function ressemblance(demande: string, trouve: string): number {
+  const a = motsSignificatifs(demande);
+  const b = motsSignificatifs(trouve);
+  if (a.size === 0) return 0;
+  let communs = 0;
+  for (const m of a) if (b.has(m)) communs++;
+  return communs / Math.max(a.size, b.size);
+}
+
+async function recherche(titre: string, langue: string) {
+  const s = await wiki({ action: "query", list: "search", srsearch: titre, srlimit: "5" }, langue);
+  const meilleurs = ((s.query?.search ?? []) as Json[])
+    .map((r) => ({ titre: r.title as string, note: ressemblance(titre, r.title) }))
+    .filter((r) => r.note >= 0.5)
+    .sort((a, b) => b.note - a.note);
+  const trouve = meilleurs[0];
+  return trouve ? { titre: trouve.titre, langue, url: urlArticle(trouve.titre, langue) } : null;
+}
+
+/** Article exact en français, sinon exact en anglais, sinon meilleure recherche. */
+async function resoudreArticle(fr: string, en?: string) {
+  const essais: Array<() => Promise<Json>> = [
+    () => titreExact(fr, "fr"),
+    () => (en ? titreExact(en, "en") : Promise.resolve(null)),
+    () => recherche(fr, "fr"),
+    () => recherche(en ?? fr, "en"),
+  ];
+  for (const essai of essais) {
     try {
-      const d = await wiki({ action: "query", titles: titre, redirects: "1", prop: "pageprops" }, langue);
-      const page = d.query?.pages?.[0];
-      if (page && !page.missing && !page.invalid && !page.pageprops?.disambiguation) {
-        return { titre: page.title as string, langue, url: urlArticle(page.title, langue) };
-      }
-      const s = await wiki({ action: "query", list: "search", srsearch: titre, srlimit: "1" }, langue);
-      const trouve = s.query?.search?.[0];
-      if (trouve) return { titre: trouve.title as string, langue, url: urlArticle(trouve.title, langue) };
+      const r = await essai();
+      if (r) return r;
     } catch (_) {
-      // on tente la langue suivante
+      // essai suivant
     }
   }
   return null;
 }
 
-async function extrait(titre: string, langue: string, longueur = 2500): Promise<string> {
+async function extrait(titre: string, langue: string, motsCles: string[], longueur = 3000): Promise<string> {
   const d = await wiki(
     { action: "query", prop: "extracts", explaintext: "1", titles: titre, redirects: "1" },
     langue,
   );
-  return ((d.query?.pages?.[0]?.extract as string) ?? "").slice(0, longueur);
+  const texte = ((d.query?.pages?.[0]?.extract as string) ?? "").replace(/\n={2,}[^=\n]+={2,}\n/g, "\n");
+  const paragraphes = texte.split(/\n+/).map((p) => p.trim().slice(0, 900)).filter((p) => p.length > 60);
+  if (paragraphes.length === 0) return "";
+  const intro = paragraphes[0].slice(0, 900);
+  const cles = motsCles.map((m) => m.toLowerCase()).filter((m) => m.length > 4);
+  const notes = paragraphes.slice(1).map((p, i) => {
+    const bas = p.toLowerCase();
+    const chiffres = (p.match(/\b(1[5-9]|20)\d{2}\b|\d+[ ,.]?\d*\s?(%|millions?|milliards?|euros?|habitants|morts|places)/g) ?? []).length;
+    const pertinence = cles.filter((m) => bas.includes(m)).length;
+    return { i, p, note: Math.min(chiffres, 4) * 2 + pertinence * 3 };
+  });
+  const retenus: { i: number; p: string }[] = [];
+  let taille = intro.length;
+  for (const n of [...notes].sort((a, b) => b.note - a.note)) {
+    if (taille + n.p.length > longueur) continue;
+    retenus.push(n);
+    taille += n.p.length;
+  }
+  retenus.sort((a, b) => a.i - b.i);
+  return [intro, ...retenus.map((r) => r.p)].join("\n");
+}
+
+function motsDe(...textes: (string | undefined)[]): string[] {
+  return textes.join(" ").split(/[^\p{L}\p{N}]+/u).filter(Boolean);
 }
 
 async function liensSortants(titre: string, langue: string): Promise<string[]> {
@@ -222,7 +282,7 @@ function portraitLecteur(profil: Json): string {
 const SYSTEME_CHEVET =
   "Tu prépares le lot du soir de Chevet, une appli qui remplace le scroll du soir au lit par de petites leçons. " +
   "Le lecteur est fatigué : tout doit être clair, concret, raconté comme une histoire vraie, sans jargon et sans morale finale. " +
-  "Tu écris en français. Tu réponds uniquement par un objet JSON valide.";
+  "Tu écris en français et tu tutoies le lecteur. Tu réponds uniquement par un objet JSON valide.";
 
 // ------------------------------------------------------------------ Étape 0 : composer
 
@@ -261,7 +321,12 @@ async function composer(lot: Json, profil: Json) {
   const flux = await lireFlux(profil.sources_rss ?? []);
   const actu = flux.articles.slice(0, 25).map((a) => `- [${a.media}] ${a.titre} — ${a.resume.slice(0, 120)}`).join("\n");
 
-  const graines = (profil.graines ?? []).filter((g: Json) => !portesPassees.includes(g.porte));
+  const grainesUtilisees = new Set<number>(
+    (anciens ?? []).flatMap((l: Json) => (l.contenu?.graines ?? []) as number[]),
+  );
+  const graines = (profil.graines ?? [])
+    .map((g: Json, index: number) => ({ ...g, index }))
+    .filter((g: Json) => !grainesUtilisees.has(g.index));
   const premierSoir = portesPassees.length === 0;
 
   const consigne = `${portraitLecteur(profil)}
@@ -270,7 +335,7 @@ Thèmes : ${(profil.interets?.themes ?? []).join(", ")}
 Centres d'intérêt détaillés : ${JSON.stringify(profil.interets)}
 
 Graines (questions posées par le lecteur, pas encore traitées) :
-${graines.map((g: Json) => `- ${g.question} → porte suggérée « ${g.porte} » (pistes : ${g.pistes})`).join("\n") || "aucune"}
+${graines.map((g: Json) => `- graine n° ${g.index} : question « ${g.question} » → titre de porte imposé « ${g.porte} » (pistes : ${g.pistes})`).join("\n") || "aucune"}
 
 Portes déjà proposées ces derniers jours (ne pas répéter) : ${portesPassees.join(" ; ") || "aucune"}
 Concepts déjà explorés (ne pas répéter) : ${conceptsVus.join(" ; ") || "aucun"}
@@ -290,14 +355,18 @@ Règles :
 - Au plus une porte « actu » : un article du jour ouvre sur un concept de fond qui l'éclaire. Jamais de faits divers.
 - Une porte peut prolonger le terrier ; une autre peut faire un saut vers un thème différent.
 - Une seule porte au plus est « mystère » : son titre reste caché, on montre seulement un indice intrigant.
-- Chaque concept correspond à un article Wikipédia qui existe (donne son titre exact, en français de préférence).
+- Une porte issue d'une graine reprend exactement le titre de porte imposé, jamais la question, et indique son numéro dans "graine".
+- Chaque concept correspond à un article Wikipédia qui existe : donne son titre exact en français et son titre exact en anglais.
+  Choisis des titres canoniques et précis (« Effet de cadrage » plutôt que « Cadrage »), jamais une œuvre ou un produit sans rapport.
+- Dans les titres, accroches et teaser, n'écris jamais « graine » ni de numéro interne.
+- Tutoie le lecteur dans les accroches et le teaser.
 - Les 3 concepts d'une porte s'enchaînent de proche en proche, du plus concret au plus large.
 - Le teaser annonce en une phrase intrigante une porte possible pour demain (une graine restante si possible).
 
 Format JSON :
-{"portes":[{"type":"graine|actu|terrier|curiosite|saut","titre":"...","accroche":"une phrase qui intrigue","mystere":false,"indice":null,
+{"portes":[{"type":"graine|actu|terrier|curiosite|saut","graine":null,"titre":"...","accroche":"une phrase qui intrigue","mystere":false,"indice":null,
 "actu":{"media":"...","titre":"...","lien":"..."} ou null,
-"concepts":[{"titre":"titre court du concept","wikipedia":"Titre exact de l'article","theme":"Sciences & techno|Histoire & sociétés|Stats, maths, data|Philo & idées"}]}],
+"concepts":[{"titre":"titre court du concept","wikipedia":"Titre exact de l'article français","wikipedia_en":"Exact English article title","theme":"Sciences & techno|Histoire & sociétés|Stats, maths, data|Philo & idées"}]}],
 "teaserDemain":"..."}`;
 
   const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 2500);
@@ -307,7 +376,10 @@ Format JSON :
   // Vérifie que chaque article existe vraiment.
   for (const porte of portes) {
     const resolus = await Promise.all(
-      (porte.concepts ?? []).slice(0, 3).map(async (c: Json) => ({ ...c, wiki: await resoudreArticle(c.wikipedia ?? c.titre) })),
+      (porte.concepts ?? []).slice(0, 3).map(async (c: Json) => ({
+        ...c,
+        wiki: await resoudreArticle(c.wikipedia ?? c.titre, c.wikipedia_en),
+      })),
     );
     porte.concepts = resolus.filter((c) => c.wiki);
     porte.id = slug(porte.titre ?? "porte");
@@ -315,6 +387,7 @@ Format JSON :
 
   return {
     portes: portes.filter((p: Json) => p.concepts.length > 0),
+    graines: portes.map((p: Json) => p.graine).filter((g: Json) => Number.isInteger(g)),
     teaserDemain: resultat.teaserDemain ?? "",
     curiosites: curiosites.map((c) => c.id),
     flux: flux.etat,
@@ -326,8 +399,9 @@ Format JSON :
 async function rediger(travail: Json, i: number, profil: Json) {
   const porte = travail.portes?.[i];
   if (!porte) return;
+  const cles = motsDe(porte.titre, porte.accroche, porte.actu?.titre);
   for (const c of porte.concepts) {
-    if (!c.extrait) c.extrait = await extrait(c.wiki.titre, c.wiki.langue);
+    if (!c.extrait) c.extrait = await extrait(c.wiki.titre, c.wiki.langue, [...cles, ...motsDe(c.titre)]);
   }
 
   const consigne = `${portraitLecteur(profil)}
@@ -342,14 +416,28 @@ ${porte.concepts.map((c: Json, k: number) => `### Concept ${k + 1} : ${c.titre} 
 Règles :
 - N'utilise que des faits présents dans l'article fourni. Pas de chiffre, de date ni de nom qui n'y figure pas.
 - 2 à 5 cartes par concept, 40 mots au plus par carte, une idée par carte.
-- Raconte : une scène, une personne, une anecdote vraie de l'article ; pas de liste, pas de jargon.
+- Raconte : la première carte pose une scène datée, un lieu ou une personne réelle de l'article ; pas de définition de dictionnaire, pas de liste, pas de jargon.
+- Au moins une carte par concept contient une date ou un chiffre de l'article.
+- Relie le concept à la question de la porte : explique le pourquoi, pas seulement le quoi.
+- N'invente jamais de scène, de personnage, de dialogue ni d'exemple : tout vient de l'article. S'il ne raconte pas d'histoire, pars d'un fait daté.
+- Si l'article ne parle pas vraiment du concept ou de la porte, renvoie pour ce concept seulement {"titre":"...","horsSujet":true}.
 - "question" : la question qui ouvre le concept et donne envie de glisser.
 - Le premier concept accroche la porte ; chaque concept suivant s'enchaîne avec le précédent.
 - "aRetenir" : une phrase à retenir, 25 mots au plus.
 - "aRaconter" : la version à placer dans une conversation, 35 mots au plus.
-- "ordreDeGrandeur" : un chiffre de l'article qui ancre l'idée, ou null.
+- "ordreDeGrandeur" : une phrase courte qui donne un chiffre de l'article et ce qu'il mesure (ex. « 33 cahiers, près de 3 000 pages écrites en prison ») ; jamais un nombre ou une date seuls ; null si l'article n'a aucun chiffre parlant.
+- Varie les débuts de carte : au plus une carte par concept commence par une date.
+- Pas de lien de cause à effet que l'article n'établit pas lui-même.
 - "qcm" : une question de révision, 3 choix, la bonne en premier, et "autreAngle" qui réexplique autrement en 30 mots.
 - "creuser" : 3 questions courtes qu'on aurait envie de poser après cette carte.
+
+Exemple du ton attendu (sur un autre sujet) :
+{"titre":"L'hégémonie culturelle","question":"Comment un système tient-il debout, s'il ne repose pas seulement sur la force ?",
+"cartes":["1929, prison de Turi, en Italie. Antonio Gramsci, dirigeant communiste emprisonné par le régime de Mussolini, commence à remplir des cahiers d'écolier.",
+"Sa question : pourquoi la révolution a-t-elle eu lieu en Russie, mais pas dans l'Europe de l'Ouest industrialisée ?",
+"Sa réponse : à l'Ouest, le pouvoir ne tient pas que par la police. Il tient par le consentement : l'école, la presse, l'Église diffusent une vision du monde qui devient le « bon sens »."],
+"aRetenir":"Un pouvoir solide ne se contente pas de contraindre : il rend son ordre évident.",
+"ordreDeGrandeur":"33 cahiers, près de 3 000 pages écrites en prison."}
 
 Format JSON :
 {"concepts":[{"titre":"...","question":"...","cartes":["...","..."],"aRetenir":"...","aRaconter":"...","ordreDeGrandeur":"..." ou null,
@@ -367,7 +455,8 @@ async function relire(travail: Json, i: number) {
 
   const consigne = `Tu es relecteur factuel. Pour chaque concept, compare chaque carte, "aRetenir", "aRaconter",
 "ordreDeGrandeur" et le QCM à l'article source. Corrige toute affirmation absente de l'article ou déformée,
-ou supprime la carte si elle ne peut pas être sauvée (garde au moins 2 cartes). Ne change pas le style ni la structure.
+ou supprime la carte si elle ne peut pas être sauvée (garde au moins 2 cartes). Supprime ou réécris toute scène, personnage,
+dialogue ou exemple qui n'est pas dans l'article : c'est la faute la plus grave. Ne change pas le style ni la structure.
 
 Articles sources :
 ${porte.concepts.map((c: Json, k: number) => `### Concept ${k + 1} : ${c.titre}\n${c.extrait}`).join("\n\n")}
@@ -400,7 +489,7 @@ Format JSON : {"texte":"..."}`,
   );
 
   const portes = (travail.portes ?? [])
-    .filter((p: Json) => p.redaction?.length)
+    .filter((p: Json) => p.redaction?.some((r: Json) => r && !r.horsSujet))
     .map((p: Json) => ({
       id: p.id,
       titre: p.titre,
@@ -408,6 +497,7 @@ Format JSON : {"texte":"..."}`,
       mystere: !!p.mystere,
       indice: p.indice ?? null,
       concepts: p.redaction.map((r: Json, k: number) => {
+        if (!r || r.horsSujet || !(r.cartes ?? []).length) return null;
         const source = p.concepts[k] ?? p.concepts[0];
         const choix: string[] = r.qcm?.choix ?? [];
         const ordre = melanger(choix.map((_, idx) => idx));
@@ -429,7 +519,7 @@ Format JSON : {"texte":"..."}`,
           },
           creuser: (r.creuser ?? []).slice(0, 3),
         };
-      }),
+      }).filter((c: Json) => c !== null),
     }));
 
   if (portes.length === 0) throw new Error("Aucune porte rédigée");
@@ -444,6 +534,7 @@ Format JSON : {"texte":"..."}`,
     portes,
     pepite: { texte: pepite.texte ?? "" },
     teaserDemain: travail.teaserDemain ?? "",
+    graines: travail.graines ?? [],
   };
 }
 
