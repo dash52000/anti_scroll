@@ -30,6 +30,17 @@
 //                                         articles Wikipédia liés à un concept, pas encore explorés,
 //                                         choisis par l'IA pour le graphe du terrier (gardés en cache).
 //
+// Actions de l'exploration (avec le JWT de l'utilisateur) :
+//   {"action":"crans","porte":{titre,accroche},"depuis":{id,titre,url,theme,profondeur},"chemin":[...],"court":false}
+//                                         « plus loin » et « à côté » depuis un concept, une étape par
+//                                         appel ; les titres arrivent dès la première étape.
+//   {"action":"marque_page","porteTitre":"...","dernier":{id,titre,url},"suite":[concepts]}
+//                                         garde l'endroit où le lecteur s'arrête ; {"effacer":true} l'oublie.
+//
+// Le lot du matin tient compte du marque-page (porte « reprise »), des portes notées 8 ou plus
+// (leur suite) et, environ un jour sur trois, de l'éphéméride de Wikipédia. Chaque carte garde la
+// phrase de l'article qui la prouve ; un contre-point et un pont s'ajoutent quand l'article les porte.
+//
 // Tout est idempotent : un lot prêt ne bouge plus, donc un appel en trop ne coûte rien.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
@@ -301,13 +312,120 @@ function motsDe(...textes: (string | undefined)[]): string[] {
   return textes.join(" ").split(/[^\p{L}\p{N}]+/u).filter(Boolean);
 }
 
-async function liensSortants(titre: string, langue: string): Promise<string[]> {
+/** Liens internes d'un article. [limite] : "120" par défaut (ordre alphabétique), "max" pour tous (500). */
+async function liensSortants(titre: string, langue: string, limite = "120"): Promise<string[]> {
   const d = await wiki(
-    { action: "query", prop: "links", plnamespace: "0", pllimit: "120", titles: titre, redirects: "1" },
+    { action: "query", prop: "links", plnamespace: "0", pllimit: limite, titles: titre, redirects: "1" },
     langue,
   );
   return (d.query?.pages?.[0]?.links ?? []).map((l: Json) => l.title as string);
 }
+
+// ------------------------------------------------------------------ Preuve en un tap
+
+/**
+ * Retrouve dans l'article la phrase (ou les deux phrases) qui correspond le mieux à la citation
+ * donnée par le vérificateur, et le paragraphe autour, coupé à environ 600 caractères.
+ * Le passage est toujours une sous-chaîne exacte du contexte : l'appli le surligne tel quel.
+ */
+function localiser(preuve: string | undefined, source: string): { passage: string; contexte: string } | null {
+  if (!preuve || !source) return null;
+  const mots = new Set(normaliser(preuve).split(" ").filter((m) => m.length > 3));
+  if (mots.size === 0) return null;
+  let meilleur: { score: number; bloc: string; p: string } | null = null;
+  for (const p of source.split(/\n+/).map((x) => x.trim()).filter(Boolean)) {
+    const phrases = p.match(/[^.!?…]+[.!?…]+[»")\]]*\s*|[^.!?…]+$/g) ?? [p];
+    for (let i = 0; i < phrases.length; i++) {
+      for (const n of [1, 2]) {
+        if (i + n > phrases.length) continue;
+        const bloc = phrases.slice(i, i + n).join("").trim();
+        if (!bloc) continue;
+        const motsBloc = new Set(normaliser(bloc).split(" "));
+        let communs = 0;
+        for (const m of mots) if (motsBloc.has(m)) communs++;
+        // Deux phrases ne gagnent que si elles couvrent nettement mieux la citation.
+        const score = communs / mots.size - (n === 2 ? 0.08 : 0);
+        if (!meilleur || score > meilleur.score) meilleur = { score, bloc, p };
+      }
+    }
+  }
+  if (!meilleur || meilleur.score < 0.55) return null;
+  const { bloc, p } = meilleur;
+  const i = p.indexOf(bloc);
+  if (i < 0) return null;
+  let debut = Math.max(0, i - 260);
+  let fin = Math.min(p.length, i + bloc.length + 260);
+  if (debut > 0) {
+    const espace = p.indexOf(" ", debut);
+    if (espace >= 0 && espace < i) debut = espace + 1;
+  }
+  if (fin < p.length) {
+    const espace = p.lastIndexOf(" ", fin);
+    if (espace > i + bloc.length) fin = espace;
+  }
+  const contexte = (debut > 0 ? "…" : "") + p.slice(debut, fin).trim() + (fin < p.length ? "…" : "");
+  return { passage: bloc, contexte };
+}
+
+// ------------------------------------------------------------------ Ponts
+
+/** Un concept vu il y a plus d'une semaine, que l'article d'un concept du soir rappelle. */
+type Pont = { id: string; titre: string; le: string; wiki: string };
+
+/**
+ * Cherche, pour chaque concept, un concept du terrier vu il y a plus de 7 jours dont l'article est
+ * lié depuis le sien (ou cité dans son extrait, si [extraits] est fourni). Un seul pont par porte :
+ * le premier concept qui en trouve un le garde, les autres n'en ont pas.
+ */
+async function pontsPossibles(userId: string | null, concepts: Json[]): Promise<(Pont | null)[]> {
+  const aucun = concepts.map(() => null);
+  if (!userId || concepts.length === 0) return aucun;
+  const limite = new Date(Date.now() - 7 * 86_400_000).toISOString();
+  const { data: anciens } = await admin.from("chevet_concepts")
+    .select("slug, titre, wikipedia_url, decouvert_le")
+    .eq("user_id", userId).lt("decouvert_le", limite)
+    .order("decouvert_le", { ascending: false }).limit(400);
+  if (!anciens?.length) return aucun;
+  const parArticle = new Map<string, Json>();
+  for (const a of anciens) {
+    const t = titreDepuisUrl(a.wikipedia_url);
+    if (t) parArticle.set(normaliser(t), a);
+  }
+  const resultat: (Pont | null)[] = [...aucun];
+  for (let k = 0; k < concepts.length; k++) {
+    const c = concepts[k];
+    if (!c?.wiki) continue;
+    const ici = slug(c.wiki.titre);
+    let trouve: Json = null;
+    try {
+      const liens = await liensSortants(c.wiki.titre, c.wiki.langue, "max");
+      for (const l of liens) {
+        const a = parArticle.get(normaliser(l));
+        if (a && a.slug !== ici) {
+          trouve = a;
+          break;
+        }
+      }
+    } catch (_) { /* pas de pont pour ce concept */ }
+    if (trouve) {
+      resultat[k] = {
+        id: trouve.slug,
+        titre: trouve.titre,
+        le: String(trouve.decouvert_le ?? "").slice(0, 10),
+        wiki: titreDepuisUrl(trouve.wikipedia_url),
+      };
+      break;
+    }
+  }
+  return resultat;
+}
+
+function joursDepuis(date: string): number {
+  const t = Date.parse(date);
+  return Number.isFinite(t) ? Math.max(1, Math.round((Date.now() - t) / 86_400_000)) : 7;
+}
+
+const MOTS_CRITIQUE = ["critique", "critiques", "critiqué", "objection", "détracteurs", "opposants", "controverse", "contesté"];
 
 // ------------------------------------------------------------------ Consignes communes
 
@@ -432,10 +550,66 @@ const SYSTEME_CHEVET =
   "Le lecteur est fatigué : tout doit être clair, concret, raconté comme une histoire vraie, sans jargon et sans morale finale. " +
   "Tu écris en français et tu tutoies le lecteur. Tu réponds uniquement par un objet JSON valide.";
 
+// ------------------------------------------------------------------ Éphéméride
+
+type Evenement = { annee: number; texte: string; articles: string[] };
+
+/** Les événements du jour (« ce jour-là ») d'après Wikipédia, en français si possible. */
+async function evenementsDuJour(jour: string): Promise<Evenement[]> {
+  const [, mm, dd] = jour.split("-");
+  const adresses = [
+    `https://fr.wikipedia.org/api/rest_v1/feed/onthisday/events/${mm}/${dd}`,
+    `https://api.wikimedia.org/feed/v1/wikipedia/fr/onthisday/events/${mm}/${dd}`,
+    `https://api.wikimedia.org/feed/v1/wikipedia/en/onthisday/events/${mm}/${dd}`,
+  ];
+  for (const adresse of adresses) {
+    try {
+      const r = await fetch(adresse, { headers: { "User-Agent": UA }, signal: AbortSignal.timeout(8000) });
+      if (!r.ok) continue;
+      const d = await r.json();
+      const evenements: Evenement[] = ((d.events ?? []) as Json[])
+        .map((e) => ({
+          annee: Number(e.year),
+          texte: String(e.text ?? "").replace(/\s+/g, " ").trim(),
+          articles: ((e.pages ?? []) as Json[])
+            .map((p) => String(p.titles?.normalized ?? p.normalizedtitle ?? p.title ?? "").replaceAll("_", " "))
+            .filter(Boolean)
+            .slice(0, 3),
+        }))
+        .filter((e) => Number.isInteger(e.annee) && e.texte);
+      if (evenements.length) return evenements;
+    } catch (_) {
+      // adresse suivante
+    }
+  }
+  return [];
+}
+
+/** Environ un lot sur trois, jamais deux éphémérides à moins de 3 jours d'écart. */
+function eligibleEphemeride(anciens: Json[], jour: string): boolean {
+  const limite = Date.parse(jour) - 3 * 86_400_000;
+  const recente = anciens.some((l: Json) =>
+    Date.parse(l.jour) > limite && (l.contenu?.portes ?? []).some((p: Json) => p.type === "ephemeride")
+  );
+  return !recente && Math.random() < 0.7;
+}
+
+/** Date ISO (AAAA-MM-JJ) décalée de [jours] par rapport à [jour]. */
+function decaler(jour: string, jours: number): string {
+  return new Date(Date.parse(jour) + jours * 86_400_000).toISOString().slice(0, 10);
+}
+
 // ------------------------------------------------------------------ Étape 0 : composer
 
 /** Ce qu'une composition de portes bonus ne doit pas répéter : les portes et concepts de ce soir. */
 type Exclusions = { portes: string[]; concepts: string[]; graines: number[] };
+
+/** Un concept écrit, tel que l'appli le renvoie dans un marque-page : assez complet pour être relu. */
+function conceptValide(c: Json): boolean {
+  return !!c && typeof c === "object" && typeof c.id === "string" && typeof c.titre === "string" &&
+    Array.isArray(c.cartes) && c.cartes.length > 0 && c.source && typeof c.source.url === "string" &&
+    c.qcm && Array.isArray(c.qcm.choix);
+}
 
 /**
  * Compose 3 portes. Sans [bonus], c'est le lot du matin ; avec, ce sont des portes en plus
@@ -495,6 +669,46 @@ async function composer(lot: Json, profil: Json, bonus?: Exclusions) {
     curiosites = data ?? [];
   }
 
+  // Marque-page d'hier : une porte « reprise », toute prête si les concepts suivants étaient écrits,
+  // sinon composée ici comme les autres. Elle s'affiche en tête et ne compte pas dans le plafond.
+  let repriseFaite: Json = null;
+  let repriseAComposer: Json = null;
+  let marquePage = false;
+  // Portes notées 8 ou plus ces 7 derniers jours : leur suite est proposée.
+  let adorees: Json[] = [];
+  let evenements: Evenement[] = [];
+  if (userId && !bonus) {
+    const { data: mp } = await admin.from("chevet_marque_page").select("*")
+      .eq("user_id", userId).eq("utilise", false).maybeSingle();
+    if (mp && Date.parse(mp.cree_le) > Date.now() - 3 * 86_400_000) {
+      marquePage = true;
+      const suite: Json[] = (Array.isArray(mp.suite) ? mp.suite : []).filter(conceptValide).slice(0, 3);
+      const apres = mp.dernier?.titre ? `après « ${mp.dernier.titre} »` : "en chemin";
+      if (suite.length) {
+        repriseFaite = {
+          id: `reprise-${lot.jour}`,
+          titre: suite[0].titre,
+          accroche: `Hier, tu t'es arrêté ${apres}${mp.porte_titre ? `, dans « ${mp.porte_titre} »` : ""}.`,
+          mystere: false,
+          indice: null,
+          type: "reprise",
+          reprise: true,
+          concepts: suite,
+        };
+      } else if (mp.dernier?.titre) {
+        repriseAComposer = { dernier: mp.dernier.titre, porte: mp.porte_titre ?? "" };
+      }
+    }
+    const { data: notes } = await admin.from("chevet_notes_portes").select("jour, porte_id, porte_titre, note")
+      .eq("user_id", userId).gte("note", 8).eq("suite_servie", false).gte("jour", decaler(lot.jour, -7))
+      .order("note", { ascending: false }).limit(2);
+    adorees = notes ?? [];
+  }
+  if (!bonus && eligibleEphemeride(anciens ?? [], lot.jour)) {
+    evenements = melanger(await evenementsDuJour(lot.jour)).slice(0, 40);
+  }
+  const anneeCourante = Number(lot.jour.slice(0, 4));
+
   const flux = await lireFlux(profil.sources_rss ?? []);
   const actu = flux.articles.slice(0, 25).map((a) => `- [${a.media}] ${a.titre} — ${a.resume.slice(0, 120)}`).join("\n");
 
@@ -525,6 +739,9 @@ Concepts aimés par le lecteur (un cœur sur une de leurs cartes) : ${aimes.map(
 ${prolonges.length ? `Le lecteur a demandé à prolonger : ${prolonges.map((c) => `« ${c.titre} »${c.prolonger_vers ? ` (vers « ${c.prolonger_vers} »)` : ""}`).join(" ; ")}` : ""}
 
 Curiosités notées par le lecteur : ${curiosites.map((c) => c.texte || c.url).join(" ; ") || "aucune"}
+${adorees.length ? `\nPortes que le lecteur a adorées (8/10 ou plus) : ${adorees.map((n) => `« ${n.porte_titre} » (${n.note}/10)`).join(" ; ")}` : ""}
+${repriseAComposer ? `\nHier soir, le lecteur s'est arrêté après « ${repriseAComposer.dernier} »${repriseAComposer.porte ? ` (porte « ${repriseAComposer.porte} »)` : ""}.` : ""}
+${evenements.length ? `\nÉphéméride : ce qui s'est passé un ${Number(lot.jour.slice(8, 10))}/${Number(lot.jour.slice(5, 7))}, avec l'année :\n${evenements.map((e) => `- ${e.annee} : ${e.texte}${e.articles.length ? ` (articles : ${e.articles.join(", ")})` : ""}`).join("\n")}` : ""}
 
 Actu du jour (sources choisies par le lecteur) :
 ${actu || "indisponible"}
@@ -534,7 +751,7 @@ ${bonus
     : "Compose le lot de ce soir : exactement 3 portes, chacune ouvrant sur un tunnel de 3 concepts."}
 Règles :
 - ${premierSoir ? "C'est le tout premier soir : fais un best of, au moins 2 portes issues des graines." : "Si des graines restent, une porte au moins en est issue."}
-${prolonges.length ? "- Une porte au moins prolonge un concept que le lecteur a demandé à prolonger (type terrier), en partant de lui ou du voisin indiqué.\n" : ""}- Les portes qui prolongent le terrier partent de préférence des concepts aimés.
+${prolonges.length ? "- Une porte au moins prolonge un concept que le lecteur a demandé à prolonger (type terrier), en partant de lui ou du voisin indiqué.\n" : ""}${adorees.length ? "- Une porte au moins propose la suite d'une porte adorée (type terrier), en partant de ses derniers concepts, sans les répéter.\n" : ""}${repriseAComposer ? `- Une porte est de type "reprise" : elle reprend là où le lecteur s'est arrêté, en creusant un aspect plus précis de « ${repriseAComposer.dernier} » ; son titre est celui de son premier concept et son accroche commence par « Hier, tu t'es arrêté après « ${repriseAComposer.dernier} » ».\n` : ""}${evenements.length ? `- Une porte est de type "ephemeride" : elle part de l'événement de l'éphéméride qui touche le plus les centres d'intérêt du lecteur, survenu il y a au moins 50 ans ; indique "ephemeride":{"annee":…,"evenement":"l'événement en une phrase courte"}. Ses concepts sont des articles Wikipédia comme les autres, le premier au plus près de l'événement.\n` : ""}- Les portes qui prolongent le terrier partent de préférence des concepts aimés.
 - Si une curiosité existe, une porte en part.
 - Au plus une porte « actu » : un article du jour ouvre sur un concept de fond qui l'éclaire. Jamais de faits divers.
 - Une porte peut prolonger le terrier ; une autre peut faire un saut vers un thème différent.
@@ -548,16 +765,17 @@ ${prolonges.length ? "- Une porte au moins prolonge un concept que le lecteur a 
 - Le teaser annonce en une phrase intrigante une porte possible pour demain (une graine restante si possible).
 
 Format JSON :
-{"portes":[{"type":"graine|actu|terrier|curiosite|saut","graine":null,"titre":"...","accroche":"une phrase qui intrigue","mystere":false,"indice":null,
-"actu":{"media":"...","titre":"...","lien":"..."} ou null,
+{"portes":[{"type":"graine|actu|terrier|curiosite|saut${repriseAComposer ? "|reprise" : ""}${evenements.length ? "|ephemeride" : ""}","graine":null,"titre":"...","accroche":"une phrase qui intrigue","mystere":false,"indice":null,
+"actu":{"media":"...","titre":"...","lien":"..."} ou null,${evenements.length ? `\n"ephemeride":{"annee":1871,"evenement":"..."} ou null,` : ""}
 "concepts":[{"titre":"titre court du concept","wikipedia":"Titre exact de l'article français","wikipedia_en":"Exact English article title","theme":"${Object.keys(poidsThemes(profil)).join("|")}"}]}],
 "teaserDemain":"..."}`;
 
-  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 2500);
+  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 2800);
   const portes = (resultat.portes ?? []).slice(0, 3);
   if (portes.length === 0) throw new Error("Composition vide");
 
   // Vérifie que chaque article existe vraiment.
+  const annees = new Set(evenements.map((e) => e.annee));
   for (const porte of portes) {
     const resolus = await Promise.all(
       (porte.concepts ?? []).slice(0, 3).map(async (c: Json) => ({
@@ -567,6 +785,16 @@ Format JSON :
     );
     porte.concepts = resolus.filter((c) => c.wiki);
     porte.id = slug(porte.titre ?? "porte");
+    // Une éphéméride n'est gardée que si son année vient bien de la liste du jour.
+    const e = porte.ephemeride;
+    const annee = Number(e?.annee);
+    if (porte.type === "ephemeride" && Number.isInteger(annee) && annees.has(annee) && annee <= anneeCourante - 20) {
+      porte.ephemeride = { annee, evenement: String(e.evenement ?? "").slice(0, 200) };
+    } else {
+      if (porte.type === "ephemeride") porte.type = "saut";
+      porte.ephemeride = null;
+    }
+    if (porte.type === "reprise" && !repriseAComposer) porte.type = "terrier";
   }
 
   return {
@@ -576,33 +804,77 @@ Format JSON :
     curiosites: curiosites.map((c) => c.id),
     prolonges: prolonges.map((c) => c.id),
     flux: flux.etat,
+    userId,
+    repriseFaite,
+    marquePage,
+    adorees: adorees.map((n) => ({ jour: n.jour, porte_id: n.porte_id })),
   };
 }
 
 // ------------------------------------------------------------------ Étapes 1-3 : rédiger une porte
 
-async function rediger(travail: Json, i: number, profil: Json) {
+/**
+ * Options de rédaction. [crans] : les concepts sont des suites possibles et indépendantes du dernier
+ * lu (« plus loin », « à côté »), pas un tunnel. [court] : après l'heure de coucher, cartes courtes.
+ */
+type OptionsRedaction = { userId?: string | null; crans?: boolean; court?: boolean };
+
+async function rediger(travail: Json, i: number, profil: Json, options: OptionsRedaction = {}) {
   const porte = travail.portes?.[i];
   if (!porte) return;
+
+  // Un seul pont possible par porte, cherché avant l'extrait pour que le paragraphe qui en parle soit gardé.
+  if (porte.ponts === undefined) {
+    porte.ponts = await pontsPossibles(options.userId ?? travail.userId ?? null, porte.concepts);
+  }
+  const ponts: (Pont | null)[] = porte.ponts ?? [];
+
   const cles = motsDe(porte.titre, porte.accroche, porte.actu?.titre);
+  porte.concepts.forEach((c: Json, k: number) => {
+    c.critique = /^(Philo|Histoire)/.test(String(c.theme ?? ""));
+    c.motsPont = ponts[k] ? motsDe(ponts[k]!.wiki) : [];
+  });
   for (const c of porte.concepts) {
-    if (!c.extrait) c.extrait = await extrait(c.wiki.titre, c.wiki.langue, [...cles, ...motsDe(c.titre)]);
+    if (!c.extrait) {
+      c.extrait = await extrait(
+        c.wiki.titre,
+        c.wiki.langue,
+        [...cles, ...motsDe(c.titre), ...(c.critique ? MOTS_CRITIQUE : []), ...(c.motsPont ?? [])],
+      );
+    }
   }
 
   // Longueur réglée par le lecteur ; la vérification en a besoin pour borner les cartes gardées.
-  const longueur = longueurCartes(profil);
+  const reglee = longueurCartes(profil);
+  const longueur = options.court
+    ? { mots: 25, min: 1, max: 2 }
+    : options.crans
+    ? { mots: reglee.mots, min: Math.min(2, reglee.min), max: 3 }
+    : reglee;
   porte.cartesMin = longueur.min;
   porte.cartesMax = longueur.max;
 
   // Réécriture de la suite d'une porte : le lecteur a déjà lu le début du tunnel.
   const dejaLus: string[] = porte.dejaLus ?? [];
+  const lignePont = ponts.map((p, k) =>
+    p
+      ? `Pont possible : le concept ${k + 1} « ${porte.concepts[k].titre} » peut rappeler « ${p.titre} », que le lecteur a exploré il y a ${joursDepuis(p.le)} jours (article « ${p.wiki} »).`
+      : ""
+  ).filter(Boolean).join("\n");
   const consigne = `${portraitLecteur(profil)}
 
 Porte : « ${porte.titre} » — ${porte.accroche}
 ${porte.actu ? `Elle part de cette actu : [${porte.actu.media}] ${porte.actu.titre}` : ""}
-${dejaLus.length ? `Le lecteur a déjà lu, dans cette porte : ${dejaLus.map((t) => `« ${t} »`).join(", ")}. Les concepts ci-dessous en sont la suite.` : ""}
+${
+    options.crans
+      ? `Le lecteur vient de lire « ${dejaLus.at(-1) ?? porte.titre} ». Les concepts ci-dessous sont des suites possibles et indépendantes : chacun se lit seul, juste après lui ; ils ne s'enchaînent pas entre eux.`
+      : dejaLus.length
+      ? `Le lecteur a déjà lu, dans cette porte : ${dejaLus.map((t) => `« ${t} »`).join(", ")}. Les concepts ci-dessous en sont la suite.`
+      : ""
+  }
+${lignePont}
 
-Concepts du tunnel, dans l'ordre, avec l'article Wikipédia qui fait foi :
+${options.crans ? "Concepts, chacun avec l'article Wikipédia qui fait foi :" : "Concepts du tunnel, dans l'ordre, avec l'article Wikipédia qui fait foi :"}
 ${porte.concepts.map((c: Json, k: number) => `### Concept ${k + 1} : ${c.titre} (thème ${c.theme})\n${c.extrait}`).join("\n\n")}
 
 Écris les cartes de chaque concept.
@@ -617,7 +889,17 @@ Règles :
 - N'invente jamais de scène, de personnage, de dialogue ni d'exemple : tout vient de l'article. S'il ne raconte pas d'histoire, pars d'un fait daté.
 - Si l'article ne parle pas vraiment du concept ou de la porte, renvoie pour ce concept seulement {"titre":"...","horsSujet":true}.
 - "question" : la question qui ouvre le concept et donne envie de glisser.
-- ${dejaLus.length ? `Le premier concept prend la suite de « ${dejaLus.at(-1)} »` : "Le premier concept accroche la porte"} ; chaque concept suivant s'enchaîne avec le précédent.
+- ${
+    options.crans
+      ? `Chaque concept prend la suite de « ${dejaLus.at(-1) ?? porte.titre} » : sa question part de ce que le lecteur vient de lire.`
+      : `${dejaLus.length ? `Le premier concept prend la suite de « ${dejaLus.at(-1)} »` : "Le premier concept accroche la porte"} ; chaque concept suivant s'enchaîne avec le précédent.`
+  }
+- "contrePoint" : seulement si le concept est une idée politique, économique, sociale ou philosophique discutée ET que son article rapporte une critique, une objection ou une position adverse. Écris alors la meilleure objection, en ${longueur.mots} mots au plus, attribuée à ceux qui la portent dans l'article (« Ses critiques répondent que… », « Pour les économistes libéraux… »), sans la réfuter ni conclure. Sinon null.
+- "pont" : ${
+    lignePont
+      ? `seulement pour le concept du pont possible indiqué plus haut, et seulement si son article parle lui-même de l'autre concept : une carte de ${longueur.mots} mots au plus qui commence par « Tu te souviens » et dit, avec les seuls faits de l'article, ce qui relie les deux. Sinon null.`
+      : "toujours null."
+  }
 - "aRetenir" : une phrase à retenir, 25 mots au plus.
 - "aRaconter" : la version à placer dans une conversation, 35 mots au plus.
 - "ordreDeGrandeur" : une phrase courte qui donne un chiffre de l'article, en lien direct avec la porte, et ce qu'il mesure (ex. « 33 cahiers, près de 3 000 pages écrites en prison ») ; jamais un nombre ou une date seuls ; null si l'article n'a aucun chiffre parlant.
@@ -636,9 +918,10 @@ Exemple du ton attendu (sur un autre sujet) :
 
 Format JSON :
 {"concepts":[{"titre":"...","question":"...","cartes":["...","..."],"aRetenir":"...","aRaconter":"...","ordreDeGrandeur":"..." ou null,
+"contrePoint":"..." ou null,"pont":"..." ou null,
 "qcm":{"question":"...","choix":["bonne","fausse","fausse"],"autreAngle":"..."},"creuser":["...","...","..."]}]}`;
 
-  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 3200, 0.5);
+  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 3600, 0.5);
   porte.redaction = resultat.concepts ?? [];
 }
 
@@ -689,6 +972,7 @@ Une carte est "faux" si elle contient : un sens inversé (« avec » au lieu de 
 Les reformulations, images et transitions de style sont permises tant qu'elles n'ajoutent aucun fait.
 "aRetenir" et "aRaconter" : verdict "ok" ou "faux" ; si "faux", donne une version corrigée de même longueur, dans le même ton, qui ne dit que ce que l'article prouve et parle du sujet, jamais de l'article.
 "ordreDeGrandeur" : sa preuve exacte si le chiffre vient de l'article et concerne la porte « ${porte.titre} », sinon null.
+"contrePoint" et "pont", s'ils existent, se jugent comme des cartes (verdict + preuve) ; un contre-point doit rapporter une objection que l'article attribue bien à ses auteurs, un pont un lien que l'article fait lui-même. Absents : null.
 
 ${valides.map(({ r, k }: Json) => `### Concept ${k + 1} : ${r.titre}
 Article source :
@@ -697,16 +981,24 @@ Cartes à juger :
 ${(r.cartes ?? []).map((c: string, n: number) => `${n + 1}. ${c}`).join("\n")}
 aRetenir : ${r.aRetenir ?? ""}
 aRaconter : ${r.aRaconter ?? ""}
-ordreDeGrandeur : ${r.ordreDeGrandeur ?? "null"}`).join("\n\n")}
+ordreDeGrandeur : ${r.ordreDeGrandeur ?? "null"}
+contrePoint : ${typeof r.contrePoint === "string" && r.contrePoint ? r.contrePoint : "null"}
+pont : ${typeof r.pont === "string" && r.pont ? r.pont : "null"}`).join("\n\n")}
 
 Réponds dans le même ordre, un objet par concept, une entrée par carte dans l'ordre :
 {"concepts":[{"cartes":[{"verdict":"ok","preuve":"citation exacte"},{"verdict":"faux","preuve":null,"raison":"..."}],
-"aRetenir":{"verdict":"ok"},"aRaconter":{"verdict":"faux","corrige":"..."},"ordreDeGrandeur":{"preuve":"citation exacte"} ou null}]}`;
+"aRetenir":{"verdict":"ok"},"aRaconter":{"verdict":"faux","corrige":"..."},"ordreDeGrandeur":{"preuve":"citation exacte"} ou null,
+"contrePoint":{"verdict":"ok","preuve":"citation exacte"} ou null,"pont":{"verdict":"ok","preuve":"citation exacte"} ou null}]}`;
 
-  const resultat = await groq(MODELE_VERIFICATION, SYSTEME_CHEVET, consigne, 4000, 0.1);
+  const resultat = await groq(MODELE_VERIFICATION, SYSTEME_CHEVET, consigne, 4500, 0.1);
   const verifs: Json[] = Array.isArray(resultat.concepts) ? resultat.concepts : [];
   if (verifs.length !== valides.length) {
+    // Sans vérification exploitable, les cartes restent mais aucun extra (contre-point, pont) n'est gardé.
     porte.corrections = ["Vérification inutilisable : texte d'origine conservé."];
+    for (const { r } of valides) {
+      r.contrePoint = null;
+      r.pont = null;
+    }
     return;
   }
 
@@ -717,14 +1009,26 @@ Réponds dans le même ordre, un objet par concept, une entrée par carte dans l
   valides.forEach(({ r: original, k }: Json, n: number) => {
     const v = verifs[n] ?? {};
     const source: string = porte.concepts[k]?.extrait ?? "";
-    const cartes = ((original.cartes ?? []) as Json[]).filter((texte: Json, c: number) => {
+    const gardees: { texte: string; preuve: Json }[] = [];
+    ((original.cartes ?? []) as Json[]).forEach((texte: Json, c: number) => {
       const j = v.cartes?.[c];
       const ok = typeof texte === "string" && j?.verdict === "ok" && estProuve(j?.preuve, source);
       if (!ok) {
         retraits.push(`${original.titre}, carte ${c + 1} : ${j?.raison ?? (j?.verdict === "ok" ? "citation introuvable" : "jugée fausse")}`);
+        return;
       }
-      return ok;
-    }).slice(0, maximum);
+      gardees.push({ texte, preuve: localiser(j.preuve, source) });
+    });
+    const cartes = gardees.slice(0, maximum);
+    // Contre-point et pont : gardés seulement s'ils sont jugés justes et prouvés, comme une carte.
+    const extra = (champ: "contrePoint" | "pont") => {
+      const texte = original[champ];
+      if (typeof texte !== "string" || !texte.trim()) return null;
+      const j = v[champ];
+      if (j?.verdict === "ok" && estProuve(j?.preuve, source)) return { texte, preuve: localiser(j.preuve, source) };
+      retraits.push(`${original.titre}, ${champ} retiré`);
+      return null;
+    };
     // Synthèse jugée fausse : la correction si elle parle du sujet, sinon une carte prouvée.
     const synthese = (champ: string, repli: string | undefined) => {
       const j = v[champ];
@@ -736,12 +1040,15 @@ Réponds dans le même ordre, un objet par concept, une entrée par carte dans l
     // La vérification ne touche qu'aux cartes, aux synthèses et au chiffre ; le reste vient de la rédaction.
     porte.redaction[k] = cartes.length < minimum ? { titre: original.titre, horsSujet: true } : {
       ...original,
-      cartes,
-      aRetenir: synthese("aRetenir", cartes.at(-1)),
-      aRaconter: synthese("aRaconter", cartes[0]),
+      cartes: cartes.map((c) => c.texte),
+      preuves: cartes.map((c) => c.preuve),
+      aRetenir: synthese("aRetenir", cartes.at(-1)?.texte),
+      aRaconter: synthese("aRaconter", cartes[0]?.texte),
       ordreDeGrandeur: original.ordreDeGrandeur && odg && typeof odg === "object" && estProuve(odg.preuve, source)
         ? original.ordreDeGrandeur
         : null,
+      contrePoint: extra("contrePoint"),
+      pont: extra("pont"),
     };
   });
   porte.corrections = retraits.length ? retraits : ["Toutes les cartes sont prouvées."];
@@ -749,32 +1056,54 @@ Réponds dans le même ordre, un objet par concept, une entrée par carte dans l
 
 // ------------------------------------------------------------------ Étape 7 : pépite et assemblage
 
+/** Une carte au format de l'appli, avec sa preuve quand la vérification l'a retrouvée. */
+function carteAppli(texte: string, preuve: Json) {
+  return preuve?.passage ? { texte, preuve: preuve.passage, contexte: preuve.contexte } : { texte };
+}
+
+/** Le concept k rédigé et relu d'une porte, au format de l'appli ; null s'il est tombé. */
+function conceptRedige(p: Json, k: number): Json {
+  const r = p.redaction?.[k];
+  if (!r || r.horsSujet || !(r.cartes ?? []).length) return null;
+  const source = p.concepts[k] ?? p.concepts[0];
+  const choix: string[] = r.qcm?.choix ?? [];
+  const ordre = melanger(choix.map((_, idx) => idx));
+  const preuves: Json[] = r.preuves ?? [];
+  // Contre-point et pont ne passent que vérifiés (objet {texte, preuve}) ; un texte brut est ignoré.
+  const contre = r.contrePoint && typeof r.contrePoint === "object" ? r.contrePoint : null;
+  const pont = r.pont && typeof r.pont === "object" ? r.pont : null;
+  const avec: Pont | null = p.ponts?.[k] ?? null;
+  return {
+    id: slug(source.wiki.titre),
+    titre: r.titre ?? source.titre,
+    theme: source.theme ?? "Histoire & sociétés",
+    question: r.question ?? "",
+    cartes: (r.cartes ?? []).map((t: string, n: number) => carteAppli(t, preuves[n])),
+    aRetenir: r.aRetenir ?? "",
+    aRaconter: r.aRaconter ?? "",
+    ordreDeGrandeur: r.ordreDeGrandeur ?? null,
+    source: { titre: `${source.wiki.titre}, Wikipédia`, url: source.wiki.url },
+    qcm: {
+      question: r.qcm?.question ?? "",
+      choix: ordre.map((idx) => choix[idx]),
+      bonne: ordre.indexOf(0),
+      autreAngle: r.qcm?.autreAngle ?? "",
+    },
+    creuser: (r.creuser ?? []).slice(0, 3),
+    contrePoint: contre ? carteAppli(contre.texte, contre.preuve) : null,
+    pont: pont && avec
+      ? { ...carteAppli(pont.texte, pont.preuve), avecId: avec.id, avecTitre: avec.titre, avecLe: avec.le }
+      : null,
+    // Crans : d'où ils partent, dans quel sens, à quelle profondeur.
+    ...(source.sens
+      ? { sens: source.sens, depuis: source.depuis ?? null, depuisTitre: source.depuisTitre ?? null, profondeur: source.profondeur ?? 1 }
+      : {}),
+  };
+}
+
 /** Les concepts rédigés et relus d'une porte, au format de l'appli. */
 function conceptsRediges(p: Json): Json[] {
-  return (p.redaction ?? []).map((r: Json, k: number) => {
-    if (!r || r.horsSujet || !(r.cartes ?? []).length) return null;
-    const source = p.concepts[k] ?? p.concepts[0];
-    const choix: string[] = r.qcm?.choix ?? [];
-    const ordre = melanger(choix.map((_, idx) => idx));
-    return {
-      id: slug(source.wiki.titre),
-      titre: r.titre ?? source.titre,
-      theme: source.theme ?? "Histoire & sociétés",
-      question: r.question ?? "",
-      cartes: (r.cartes ?? []).map((t: string) => ({ texte: t })),
-      aRetenir: r.aRetenir ?? "",
-      aRaconter: r.aRaconter ?? "",
-      ordreDeGrandeur: r.ordreDeGrandeur ?? null,
-      source: { titre: `${source.wiki.titre}, Wikipédia`, url: source.wiki.url },
-      qcm: {
-        question: r.qcm?.question ?? "",
-        choix: ordre.map((idx) => choix[idx]),
-        bonne: ordre.indexOf(0),
-        autreAngle: r.qcm?.autreAngle ?? "",
-      },
-      creuser: (r.creuser ?? []).slice(0, 3),
-    };
-  }).filter((c: Json) => c !== null);
+  return (p.redaction ?? []).map((_: Json, k: number) => conceptRedige(p, k)).filter((c: Json) => c !== null);
 }
 
 async function finaliser(lot: Json, travail: Json) {
@@ -790,18 +1119,26 @@ Format JSON : {"texte":"..."}`,
     0.4,
   );
 
-  const portes = (travail.portes ?? [])
+  const portes: Json[] = (travail.portes ?? [])
     .filter((p: Json) => p.redaction?.some((r: Json) => r && !r.horsSujet))
     .map((p: Json) => ({
       id: p.id,
       titre: p.titre,
       accroche: p.accroche,
-      mystere: !!p.mystere,
+      mystere: !!p.mystere && p.type !== "reprise",
       indice: p.indice ?? null,
+      type: p.type ?? null,
+      reprise: p.type === "reprise",
+      ephemeride: p.ephemeride ?? null,
       concepts: conceptsRediges(p),
-    }));
+    }))
+    .filter((p: Json) => p.concepts.length > 0);
 
   if (portes.length === 0) throw new Error("Aucune porte rédigée");
+
+  // La reprise s'affiche en tête : toute prête depuis le marque-page, ou composée avec les autres.
+  if (travail.repriseFaite) portes.unshift(travail.repriseFaite);
+  portes.sort((a, b) => Number(!!b.reprise) - Number(!!a.reprise));
 
   // Les curiosités utilisées sortent de la boîte.
   if (travail.curiosites?.length) {
@@ -810,6 +1147,14 @@ Format JSON : {"texte":"..."}`,
   // Les concepts à prolonger ont nourri ce lot : la demande est servie.
   if (travail.prolonges?.length) {
     await admin.from("chevet_concepts").update({ prolonger: false, prolonger_vers: null }).in("id", travail.prolonges);
+  }
+  // Le marque-page et les portes adorées ont nourri ce lot aussi.
+  if (travail.marquePage && lot.user_id) {
+    await admin.from("chevet_marque_page").update({ utilise: true }).eq("user_id", lot.user_id);
+  }
+  for (const n of travail.adorees ?? []) {
+    await admin.from("chevet_notes_portes").update({ suite_servie: true })
+      .eq("user_id", lot.user_id).eq("jour", n.jour).eq("porte_id", n.porte_id);
   }
 
   return {
@@ -880,7 +1225,7 @@ async function avancer(userId: string | null) {
       Object.assign(travail, await composer(lot, profil));
       maj.statut = "en_cours";
     } else if (etape <= 3) {
-      await rediger(travail, etape - 1, profil);
+      await rediger(travail, etape - 1, profil, { userId });
     } else if (etape <= 6) {
       await relire(travail, etape - 4);
     } else {
@@ -1106,7 +1451,7 @@ async function suite(userId: string, porteId: string, nbGardes: number, demande:
     if (s.etape === 0) {
       s.pt = await composerSuite(lot, porte, porte.concepts.slice(0, n), profil);
     } else if (s.etape === 1) {
-      await rediger({ portes: [s.pt] }, 0, profil);
+      await rediger({ portes: [s.pt] }, 0, profil, { userId });
     } else if (s.etape === 2) {
       await relire({ portes: [s.pt] }, 0);
     } else {
@@ -1200,7 +1545,7 @@ async function bonus(userId: string, demande: string, porteId: string | null) {
       const pt = b.portes.find((p: Json) => p.id === porteId);
       const etape = b.etapes[porteId] ?? 0;
       if (etape === 0) {
-        await rediger({ portes: [pt] }, 0, profil);
+        await rediger({ portes: [pt] }, 0, profil, { userId });
       } else if (etape === 1) {
         await relire({ portes: [pt] }, 0);
       } else {
@@ -1296,6 +1641,207 @@ Format JSON : {"voisins":[{"titre":"titre exact","accroche":"..."}]}`,
   return { voisins: resultat };
 }
 
+// ------------------------------------------------------------------ Exploration : plus loin, à côté
+
+const NB_ETAPES_CRANS = 4;
+const SENS = ["plus_loin", "a_cote"] as const;
+
+/** État public d'une ligne de crans : titres dès la composition, concepts quand ils sont prêts. */
+function etatCrans(ligne: Json, extra: Json = {}) {
+  const c = ligne?.contenu ?? {};
+  return {
+    statut: ligne?.statut ?? "indisponible",
+    etape: ligne?.etape ?? 0,
+    total: NB_ETAPES_CRANS,
+    erreur: ligne?.erreur ?? null,
+    titres: c.titres ?? null,
+    plus_loin: c.plus_loin ?? null,
+    a_cote: c.a_cote ?? null,
+    ...extra,
+  };
+}
+
+/**
+ * Étape 0 des crans : choisit deux suites au concept [depuis] — « plus loin » (le même sujet, un cran
+ * plus profond) et « à côté » (une autre facette de la question de la porte) — parmi ses liens Wikipédia.
+ */
+async function composerCrans(userId: string, porte: Json, depuis: Json, chemin: string[], profil: Json) {
+  const m = String(depuis.url ?? "").match(/https:\/\/(\w+)\.wikipedia\.org\/wiki\/(.+)$/);
+  let liens: string[] = [];
+  if (m) {
+    try {
+      liens = await liensSortants(decodeURIComponent(m[2]).replaceAll("_", " "), m[1], "max");
+    } catch (_) { /* tant pis : le modèle propose sans liste */ }
+  }
+  const { data: vus } = await admin.from("chevet_concepts").select("titre, wikipedia_url")
+    .eq("user_id", userId).order("decouvert_le", { ascending: false }).limit(200);
+  const dejaVus = new Set([
+    ...(vus ?? []).flatMap((c: Json) => [normaliser(c.titre ?? ""), normaliser(titreDepuisUrl(c.wikipedia_url))]),
+    ...chemin.map(normaliser),
+    normaliser(String(depuis.titre ?? "")),
+    normaliser(titreDepuisUrl(depuis.url)),
+  ].filter(Boolean));
+  const candidats = melanger(
+    liens.filter((t) => !dejaVus.has(normaliser(t)) && !/^(Liste|Chronologie|Portail|Catégorie|Aide|Modèle|\d)/.test(t)),
+  ).slice(0, 70);
+
+  const consigne = `${portraitLecteur(profil)}
+
+Porte : « ${porte.titre ?? ""} » — ${porte.accroche ?? ""}
+Le lecteur vient de finir « ${depuis.titre} ».
+Chemin déjà lu : ${[...chemin, depuis.titre].map((t) => `« ${t} »`).join(" → ")}
+Articles Wikipédia liés à « ${depuis.titre} » : ${candidats.join(" ; ") || "aucun"}
+
+Propose deux suites possibles, chacune un article Wikipédia qui existe :
+- "plus_loin" : creuse le même sujet un cran plus profond : un mécanisme précis, un cas, une personne, un épisode ou une notion plus fine de « ${depuis.titre} » lui-même.
+- "a_cote" : reste dans la question de la porte mais change d'angle : une autre facette, un sujet voisin au même niveau, qui éclaire la porte autrement.
+Règles :
+- De préférence parmi les articles liés ci-dessus ; titres exacts en français et en anglais, canoniques et précis.
+- Jamais un article déjà lu, jamais une liste, une année, un pays ou une ville trop générale.
+- "titre" : le titre court du concept ; "accroche" : 12 mots au plus, qui tutoie le lecteur et donne envie de glisser.
+
+Format JSON :
+{"plus_loin":{"titre":"...","wikipedia":"Titre exact français","wikipedia_en":"Exact English title","theme":"${Object.keys(poidsThemes(profil)).join("|")}","accroche":"..."},
+"a_cote":{"titre":"...","wikipedia":"...","wikipedia_en":"...","theme":"...","accroche":"..."}}`;
+
+  const resultat = await groq(MODELE_RELECTURE, SYSTEME_CHEVET, consigne, 1200, 0.5);
+  const profondeur = Math.max(0, Math.floor(Number(depuis.profondeur) || 0)) + 1;
+  const concepts: Json[] = [];
+  const titres: Json = {};
+  for (const sens of SENS) {
+    const c = resultat[sens];
+    if (!c?.wikipedia && !c?.titre) continue;
+    const w = await resoudreArticle(String(c.wikipedia ?? c.titre), c.wikipedia_en ? String(c.wikipedia_en) : undefined);
+    if (!w || dejaVus.has(normaliser(w.titre)) || concepts.some((x) => x.wiki.titre === w.titre)) continue;
+    const titre = String(c.titre ?? w.titre).slice(0, 120);
+    concepts.push({
+      titre,
+      theme: c.theme ?? depuis.theme ?? "Histoire & sociétés",
+      wiki: w,
+      sens,
+      depuis: String(depuis.id ?? ""),
+      depuisTitre: String(depuis.titre ?? ""),
+      profondeur,
+    });
+    titres[sens] = { titre, accroche: String(c.accroche ?? "").slice(0, 140) };
+  }
+  if (concepts.length === 0) throw new Error("Aucune suite trouvée");
+  return {
+    pt: {
+      titre: String(porte.titre ?? depuis.titre),
+      accroche: String(porte.accroche ?? ""),
+      actu: null,
+      concepts,
+      dejaLus: [...chemin, String(depuis.titre)],
+    },
+    titres,
+  };
+}
+
+/**
+ * « Plus loin » et « à côté » depuis un concept ou un cran, une étape par appel : composition (titres
+ * renvoyés tout de suite pour les languettes), rédaction, vérification, assemblage. Une ligne par
+ * concept de départ et par jour, avec son propre verrou : la préparation ne bloque pas le reste.
+ */
+async function crans(userId: string, corps: Json) {
+  const jour = jourParis();
+  const depuis = corps.depuis && typeof corps.depuis === "object" ? corps.depuis : {};
+  const depuisId = String(depuis.id ?? "").slice(0, 120);
+  if (!depuisId || !/^https:\/\/\w+\.wikipedia\.org\/wiki\//.test(String(depuis.url ?? ""))) {
+    return etatCrans(null, { statut: "indisponible" });
+  }
+  const chercher = () =>
+    admin.from("chevet_crans").select("*").eq("user_id", userId).eq("jour", jour).eq("depuis", depuisId).maybeSingle();
+  let { data: ligne } = await chercher();
+  if (!ligne) {
+    await admin.from("chevet_crans").upsert(
+      { user_id: userId, jour, depuis: depuisId, court: !!corps.court },
+      { onConflict: "user_id,jour,depuis", ignoreDuplicates: true },
+    );
+    ({ data: ligne } = await chercher());
+    if (!ligne) return etatCrans(null, { statut: "indisponible" });
+  }
+  if (ligne.statut === "pret" || ligne.statut === "erreur") return etatCrans(ligne);
+
+  // Verrou court : une seule étape à la fois pour cette ligne.
+  const maintenant = new Date();
+  const { data: verrou } = await admin.from("chevet_crans")
+    .update({ verrou_jusqua: new Date(maintenant.getTime() + 140_000).toISOString() })
+    .eq("id", ligne.id).eq("etape", ligne.etape)
+    .or(`verrou_jusqua.is.null,verrou_jusqua.lt."${maintenant.toISOString()}"`)
+    .select().maybeSingle();
+  if (!verrou) return etatCrans(ligne, { occupe: true });
+
+  const profil = await profilDe(userId);
+  const travail = ligne.travail ?? {};
+  const contenu = ligne.contenu ?? {};
+  const maj: Json = { verrou_jusqua: null };
+  const chemin: string[] = (Array.isArray(corps.chemin) ? corps.chemin : []).map((t: unknown) => String(t).slice(0, 120)).slice(-8);
+  try {
+    if (ligne.etape === 0) {
+      const { pt, titres } = await composerCrans(userId, corps.porte ?? {}, depuis, chemin, profil);
+      travail.pt = pt;
+      contenu.titres = titres;
+    } else if (ligne.etape === 1) {
+      await rediger({ portes: [travail.pt] }, 0, profil, { userId, crans: true, court: ligne.court });
+    } else if (ligne.etape === 2) {
+      await relire({ portes: [travail.pt] }, 0);
+    } else {
+      const pt = travail.pt;
+      for (const sens of SENS) {
+        const k = pt.concepts.findIndex((c: Json) => c.sens === sens);
+        contenu[sens] = k >= 0 ? conceptRedige(pt, k) : null;
+        if (!contenu[sens] && contenu.titres) delete contenu.titres[sens];
+      }
+      if (!contenu.plus_loin && !contenu.a_cote) throw new Error("Aucune suite après vérification");
+      maj.statut = "pret";
+      delete travail.pt;
+    }
+    maj.etape = ligne.etape + 1;
+    maj.erreur = null;
+    travail.tentatives = 0;
+  } catch (e) {
+    maj.erreur = String(e).slice(0, 500);
+    if (!(e instanceof LimiteGroq)) {
+      travail.tentatives = (travail.tentatives ?? 0) + 1;
+      if (travail.tentatives >= 3 || String(e).includes("Aucune suite")) maj.statut = "erreur";
+    }
+  }
+  maj.travail = travail;
+  maj.contenu = contenu;
+  const { data: apres } = await admin.from("chevet_crans").update(maj).eq("id", ligne.id).select().maybeSingle();
+  return etatCrans(apres ?? { ...ligne, ...maj });
+}
+
+// ------------------------------------------------------------------ Marque-page
+
+/**
+ * Garde l'endroit où le lecteur s'est arrêté : le dernier concept lu et les concepts déjà écrits qui
+ * suivaient. Le lot du lendemain en fait la porte « reprise ». {"effacer":true} : porte finie, rien à garder.
+ */
+async function enregistrerMarquePage(userId: string, corps: Json) {
+  if (corps.effacer) {
+    await admin.from("chevet_marque_page").delete().eq("user_id", userId);
+    return { ok: true };
+  }
+  let suite: Json[] = (Array.isArray(corps.suite) ? corps.suite : []).filter(conceptValide).slice(0, 3);
+  if (JSON.stringify(suite).length > 80_000) suite = suite.slice(0, 1);
+  const d = corps.dernier && typeof corps.dernier === "object" ? corps.dernier : null;
+  const dernier = d
+    ? { id: String(d.id ?? "").slice(0, 120), titre: String(d.titre ?? "").slice(0, 200), url: String(d.url ?? "").slice(0, 500) }
+    : null;
+  if (!dernier?.titre && suite.length === 0) return { ok: false };
+  const { error } = await admin.from("chevet_marque_page").upsert({
+    user_id: userId,
+    porte_titre: String(corps.porteTitre ?? "").slice(0, 200),
+    dernier,
+    suite,
+    utilise: false,
+    cree_le: new Date().toISOString(),
+  }, { onConflict: "user_id" });
+  return { ok: !error };
+}
+
 // ------------------------------------------------------------------ Réglages : nouvelle source
 
 /** Vérifie qu'une URL donne un flux RSS ou Atom lisible, et propose un nom. */
@@ -1373,6 +1919,10 @@ Deno.serve(async (req) => {
           String(corps.titre ?? ""),
           String(corps.slug ?? ""),
         ));
+      case "crans":
+        return reponse(await crans(userId, corps));
+      case "marque_page":
+        return reponse(await enregistrerMarquePage(userId, corps));
       default:
         return reponse({ erreur: `Action inconnue : ${action}` }, 400);
     }

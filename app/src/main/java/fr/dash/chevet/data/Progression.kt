@@ -69,9 +69,13 @@ class Progression(context: Context) {
                     .thenBy { it.echeance },
             )
 
-    fun marquerVus(porte: Porte, aujourdhui: LocalDate = LocalDate.now()) {
+    /**
+     * Les concepts lus d'une porte rejoignent le terrier. [lus] : ceux de la porte et les crans
+     * ouverts (« plus loin », « à côté »), dans l'ordre du fil ; un cran garde son lien vers son départ.
+     */
+    fun marquerVus(porte: Porte, lus: List<Concept> = porte.concepts, aujourdhui: LocalDate = LocalDate.now()) {
         val parId = lire().associateBy { it.concept.id }.toMutableMap()
-        porte.concepts.forEachIndexed { rang, c ->
+        lus.forEachIndexed { rang, c ->
             if (c.id !in parId) {
                 parId[c.id] = ConceptVu(
                     concept = c,
@@ -136,6 +140,31 @@ class Progression(context: Context) {
         prefs.edit().putString(CLE_PORTES_OUVERTES, "$jour|${ouvertes.joinToString(",")}").apply()
     }
 
+    // ------------------------------------------------------------ Notes des portes
+
+    private val serialiseurNotes = ListSerializer(NotePorte.serializer())
+
+    fun notes(): List<NotePorte> =
+        prefs.getString(CLE_NOTES, null)
+            ?.let { runCatching { json.decodeFromString(serialiseurNotes, it) }.getOrNull() }
+            ?: emptyList()
+
+    fun note(jour: String, porteId: String?): Int? =
+        porteId?.let { id -> notes().firstOrNull { it.jour == jour && it.porte == id }?.note }
+
+    fun noterPorte(jour: String, porte: Porte, note: Int) {
+        val nouvelle = NotePorte(
+            jour = jour,
+            porte = porte.id,
+            titre = porte.titre,
+            theme = porte.concepts.firstOrNull()?.theme,
+            type = porte.type,
+            note = note.coerceIn(1, 10),
+        )
+        val liste = notes().filterNot { it.jour == jour && it.porte == porte.id } + nouvelle
+        prefs.edit().putString(CLE_NOTES, json.encodeToString(serialiseurNotes, liste.takeLast(400))).apply()
+    }
+
     /** Bouton de test : rouvre le lot du jour et rend toutes les révisions dues. */
     fun reinitialiserPourTest() {
         prefs.edit().remove(CLE_LOT_CONSOMME).remove(CLE_PORTES_OUVERTES).apply()
@@ -147,5 +176,17 @@ class Progression(context: Context) {
         const val CLE_CONCEPTS = "concepts"
         const val CLE_LOT_CONSOMME = "lot_consomme"
         const val CLE_PORTES_OUVERTES = "portes_ouvertes"
+        const val CLE_NOTES = "notes_portes"
     }
 }
+
+/** La note de 1 à 10 donnée à une porte dans le récap. */
+@Serializable
+data class NotePorte(
+    val jour: String,
+    val porte: String,
+    val titre: String,
+    val theme: String? = null,
+    val type: String? = null,
+    val note: Int,
+)

@@ -2,9 +2,7 @@ package fr.dash.chevet.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.Crossfade
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -17,33 +15,21 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
-import androidx.compose.foundation.pager.VerticalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -52,23 +38,24 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import fr.dash.chevet.data.Coeurs
 import fr.dash.chevet.data.ConceptVu
+import fr.dash.chevet.data.Crans
 import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
 import fr.dash.chevet.data.PorteProposee
@@ -80,9 +67,12 @@ import fr.dash.chevet.model.Carte
 import fr.dash.chevet.model.Concept
 import fr.dash.chevet.model.Lot
 import fr.dash.chevet.model.Porte
+import fr.dash.chevet.model.Sens
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 /** Les étapes du rituel du soir. La porte du fil est gardée à part, pour pouvoir la réécrire. */
 private sealed interface Etape {
@@ -114,7 +104,7 @@ internal sealed interface Bonus {
 
 private const val CONCEPTS_PAR_PORTE = 3
 
-/** Plafond du fil borné : 3 portes ouvertes par soir au plus. */
+/** Plafond du fil borné : 3 portes ouvertes par soir au plus (la reprise ne compte pas). */
 internal const val PLAFOND_PORTES = 3
 
 @Composable
@@ -138,10 +128,12 @@ fun ChevetApp(
     val revisions = remember { progression.revisionsDues(coeurs::conceptAime) }
     var lot by remember { mutableStateOf(lotInitial) }
     var ouvertes by remember { mutableStateOf(progression.portesOuvertes()) }
+    // La reprise ne compte pas dans le plafond : seules les portes de sujets neufs comptent.
+    fun comptees(ids: Set<String>, l: Lot = lot) = ids.count { id -> l.portes.none { it.id == id && it.reprise } }
     var etape by remember {
         mutableStateOf<Etape>(
             when {
-                progression.lotConsomme() || ouvertes.size >= PLAFOND_PORTES -> Etape.DejaFini
+                progression.lotConsomme() || comptees(ouvertes, lotInitial) >= PLAFOND_PORTES -> Etape.DejaFini
                 revisions.isNotEmpty() -> Etape.Echauffement
                 else -> Etape.Portes
             }
@@ -165,17 +157,47 @@ fun ChevetApp(
     val portee = rememberCoroutineScope()
     val uri = LocalUriHandler.current
 
-    val restantes = lot.portes.filter { it.id !in ouvertes }
-    val plafondAtteint = ouvertes.size >= PLAFOND_PORTES
-    val peutAutrePorte = !plafondAtteint && ouvertes.isNotEmpty() && etape != Etape.Fil
+    // ------------------------------------------------ Exploration : crans, marque-page, ponts
 
-    // La nuit tombe au fil du rituel ; chaque nouvelle porte repart d'un ciel un peu plus sombre.
+    /** « Plus loin » et « à côté » de chaque concept, par concept de départ. */
+    val crans = remember { mutableStateMapOf<String, Crans>() }
+    val demandes = remember { mutableSetOf<String>() }
+    val preparation = remember { Semaphore(2) }
+    var inseres by remember { mutableStateOf<List<Concept>>(emptyList()) }
+    var enAttente by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var position by remember { mutableStateOf<Position?>(null) }
+    var pontDuSoir by remember { mutableStateOf(soiree.pontDuSoir()) }
+    var apresCoucher by remember { mutableStateOf(soiree.apresCoucher()) }
+    // Les trois premiers carrefours, la carte frémit pour montrer qu'elle bouge.
+    var carrefoursVus by remember { mutableIntStateOf(soiree.carrefoursVus) }
+    var marqueGardee by remember { mutableStateOf(false) }
+    var porteDuRecap by remember { mutableStateOf<Porte?>(null) }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(60_000)
+            apresCoucher = soiree.apresCoucher()
+        }
+    }
+
+    val restantes = lot.portes.filter { it.id !in ouvertes }
+    val plafondAtteint = comptees(ouvertes) >= PLAFOND_PORTES
+    val peutAutrePorte = !plafondAtteint && ouvertes.isNotEmpty() && etape != Etape.Fil
+    val filCourant = porteFil?.let { ordreDuFil(it.concepts, inseres) }.orEmpty()
+
+    // Le pont du soir : déjà vu ce soir, sinon le premier concept du fil qui en porte un.
+    val pontAffiche = pontDuSoir ?: filCourant.firstOrNull { it.pont != null }?.id
+
+    // La nuit tombe au fil du rituel ; chaque nouvelle porte repart d'un ciel un peu plus sombre,
+    // chaque cran de plus fonce un peu, et plus encore une fois l'heure de coucher passée.
     val debutFil = (0.25f + 0.15f * (ouvertes.size - 1).coerceAtLeast(0)).coerceAtMost(0.55f)
+    val profondeur = position?.concept?.profondeur ?: 0
     val nuit = when (etape) {
         Etape.Echauffement -> 0.05f
         Etape.Pepite -> 0.12f
         Etape.Portes -> 0.2f
-        Etape.Fil -> debutFil + (0.85f - debutFil) * progresFil
+        Etape.Fil -> (debutFil + (0.85f - debutFil) * progresFil + 0.03f * profondeur + if (apresCoucher) 0.06f else 0f)
+            .coerceAtMost(0.95f)
         Etape.Recap -> 0.9f
         Etape.AutrePorte -> 0.85f
         Etape.DejaFini -> 0.95f
@@ -193,6 +215,85 @@ fun ChevetApp(
             delay(3500)
             annonce = null
         }
+    }
+
+    /** Prépare en arrière-plan les deux sorties d'un concept, pendant qu'on le lit (deux à la fois au plus). */
+    fun demanderCrans(c: Concept) {
+        val porte = porteFil ?: return
+        if (lotExemple || !demandes.add(c.id)) return
+        val chemin = cheminVers(c, ordreDuFil(porte.concepts, inseres))
+        val court = apresCoucher
+        portee.launch {
+            preparation.withPermit {
+                distant.crans(porte, c, chemin, court) { etat -> crans[c.id] = etat }
+            }
+        }
+    }
+
+    /** Ouvre le cran [sens] du concept [depuisId] s'il est prêt ; renvoie la clé de sa première page. */
+    fun inserer(depuisId: String, sens: String): String? {
+        inseres.firstOrNull { it.depuis == depuisId && it.sens == sens }?.let { return "${it.id}:q" }
+        val brut = crans[depuisId]?.concept(sens) ?: return null
+        val dejaLa = ordreDuFil(porteFil?.concepts.orEmpty(), inseres).map { it.id }.toSet()
+        var cran = brut.copy(depuis = depuisId, sens = sens)
+        if (cran.id in dejaLa) cran = cran.copy(id = "${cran.id}-${if (sens == Sens.PLUS_LOIN) "pl" else "ac"}")
+        inseres = inseres + cran
+        journal.note("cran_ouvert", "depuis" to depuisId, "sens" to sens, "concept" to cran.id, "profondeur" to cran.profondeur)
+        return "${cran.id}:q"
+    }
+
+    // Un cran attendu arrive (ou échoue) : on l'ouvre, ou on le dit.
+    val attendu = enAttente
+    val etatAttendu = attendu?.let { crans[it.first] }
+    LaunchedEffect(attendu, etatAttendu) {
+        val (depuis, sens) = attendu ?: return@LaunchedEffect
+        val etat = etatAttendu ?: return@LaunchedEffect
+        when {
+            etat.concept(sens) != null -> {
+                inserer(depuis, sens)
+                enAttente = null
+            }
+            etat.impasse(sens) -> {
+                enAttente = null
+                annonce = "Pas de suite de ce côté ce soir : le conteur n'a rien trouvé de solide."
+            }
+        }
+    }
+
+    /**
+     * L'endroit où l'on s'arrête : le dernier concept lu jusqu'à son carrefour, et les concepts déjà
+     * écrits qui suivent (la suite de la porte, sinon le cran « plus loin » préparé).
+     */
+    fun etatMarquePage(): Pair<Concept?, List<Concept>>? {
+        val porte = porteFil ?: return null
+        val pos = position ?: return null
+        val fil = ordreDuFil(porte.concepts, inseres)
+        val i = fil.indexOfFirst { it.id == pos.concept.id }
+        if (i < 0) return null
+        return if (pos.carrefourAtteint) {
+            var suite = fil.drop(i + 1).take(3)
+            if (suite.isEmpty()) suite = listOfNotNull(crans[pos.concept.id]?.let { it.plusLoin ?: it.aCote })
+            fil[i] to suite
+        } else {
+            fil.getOrNull(i - 1) to fil.drop(i).take(3)
+        }
+    }
+
+    /** Garde le marque-page pour demain. [explicite] : « garder pour demain » plutôt qu'une fermeture. */
+    fun garderMarquePage(explicite: Boolean) {
+        if (lotExemple || etape != Etape.Fil) return
+        val porte = porteFil ?: return
+        val (dernier, suite) = etatMarquePage() ?: return
+        if (suite.isEmpty() && !explicite) return
+        if (dernier == null && suite.isEmpty()) return
+        soiree.memoriserMarquePage(suite.firstOrNull()?.titre ?: dernier?.titre)
+        journal.note("marque_page", "explicite" to explicite, "suite" to suite.size, "dernier" to dernier?.id)
+        distant.enFond { distant.marquePage(porte.titre, dernier, suite) }
+    }
+
+    // L'appli passe en arrière-plan en pleine lecture : le marque-page est gardé.
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) {
+        if (etape == Etape.Fil && !marqueGardee) garderMarquePage(explicite = false)
     }
 
     // ------------------------------------------------ Cœurs
@@ -286,7 +387,7 @@ fun ChevetApp(
             Etape.Fil -> {
                 val porte = porteFil
                 val gardes = conceptCourant + 1
-                if (porte != null && !lotExemple && gardes < CONCEPTS_PAR_PORTE) {
+                if (porte != null && !lotExemple && !porte.reprise && gardes < CONCEPTS_PAR_PORTE) {
                     lancerSuite(porte, gardes)
                 } else {
                     annonce = "C'est noté : ça vaudra pour le lot de demain."
@@ -318,11 +419,33 @@ fun ChevetApp(
     fun ouvrirPorte(porte: Porte) {
         progression.ouvrirPorte(porte.id)
         ouvertes = progression.portesOuvertes()
-        journal.note("porte_choisie", "porte" to porte.id, "rang" to ouvertes.size)
+        journal.note("porte_choisie", "porte" to porte.id, "rang" to ouvertes.size, "type" to porte.type)
         porteFil = porte
         conceptCourant = 0
         progresFil = 0f
+        inseres = emptyList()
+        enAttente = null
+        position = null
+        marqueGardee = false
         etape = Etape.Fil
+    }
+
+    /** Fin d'une porte : ses concepts et les crans ouverts rejoignent le terrier, puis le récap. */
+    fun finirPorte(porte: Porte) {
+        val lus = ordreDuFil(porte.concepts, inseres)
+        progression.marquerVus(porte, lus)
+        progression.marquerLotConsomme()
+        onConceptsExplores(lus)
+        conceptsDuSoir = lus
+        nouvellesFeuilles = lus.map { it.id }.toSet()
+        porteDuRecap = porte
+        journal.note("fil_termine", "porte" to porte.id, "crans" to inseres.size, "garde" to marqueGardee)
+        if (!marqueGardee && !lotExemple) {
+            // Porte finie : plus rien à reprendre demain.
+            soiree.memoriserMarquePage(null)
+            distant.enFond { distant.marquePage("", null, emptyList(), effacer = true) }
+        }
+        etape = Etape.Recap
     }
 
     fun composerBonus() {
@@ -356,7 +479,7 @@ fun ChevetApp(
             }
             lot = lot.copy(portes = lot.portes + porte)
             bonus = Bonus.Aucun
-            if (etape == Etape.AutrePorte && progression.portesOuvertes().size < PLAFOND_PORTES) {
+            if (etape == Etape.AutrePorte && comptees(progression.portesOuvertes()) < PLAFOND_PORTES) {
                 ouvrirPorte(porte)
             } else {
                 annonce = "Ta porte « ${porte.titre} » est prête."
@@ -366,6 +489,7 @@ fun ChevetApp(
 
     val direBonneNuit: () -> Unit = {
         journal.note("bonne_nuit")
+        if (etape == Etape.Fil && !marqueGardee) garderMarquePage(explicite = false)
         menu = null
         etoiles = true
     }
@@ -378,6 +502,11 @@ fun ChevetApp(
         journal.note("autre_porte_ouverte")
         menu = null
         etape = Etape.AutrePorte
+    }
+    val noter: (Porte, Int) -> Unit = { porte, note ->
+        progression.noterPorte(lot.jour, porte, note)
+        journal.note("note_porte", "porte" to porte.id, "note" to note)
+        if (!lotExemple) portee.launch { distant.noterPorte(lot.jour, porte, note) }
     }
 
     // Le geste retour, pendant la soirée, ouvre le menu (la soirée reste gardée).
@@ -409,6 +538,8 @@ fun ChevetApp(
 
                 Etape.Portes -> EcranPortes(
                     portes = lot.portes,
+                    jour = lot.jour,
+                    ouvertes = ouvertes,
                     bandeau = bandeau,
                     preparation = (regen as? Regen.Lot)?.preparation,
                     onChoix = { ouvrirPorte(it) },
@@ -417,7 +548,14 @@ fun ChevetApp(
                 Etape.Fil -> porteFil?.let { porte ->
                     EcranFil(
                         porte = porte,
+                        inseres = inseres,
+                        enAttente = enAttente,
                         attente = (regen as? Regen.Suite)?.takeIf { it.porteId == porte.id },
+                        crans = crans,
+                        exploration = !lotExemple,
+                        apresCoucher = apresCoucher,
+                        pontAffiche = pontAffiche,
+                        fremir = carrefoursVus <= 3,
                         journal = journal,
                         coeurs = coeurs,
                         creusagesRestants = (creusagesParSoir - creusagesFaits).coerceAtLeast(0),
@@ -429,37 +567,60 @@ fun ChevetApp(
                         onPartager = onPartager,
                         onProgres = { progresFil = it },
                         onConcept = { conceptCourant = it },
+                        onPosition = { p ->
+                            position = p
+                            demanderCrans(p.concept)
+                        },
+                        onSortie = { depuis, sens ->
+                            inserer(depuis.id, sens) ?: run {
+                                enAttente = depuis.id to sens
+                                demanderCrans(depuis)
+                                null
+                            }
+                        },
+                        onGarder = {
+                            garderMarquePage(explicite = true)
+                            marqueGardee = true
+                            annonce = "Marque-page posé : la suite t'attendra demain, en tête des portes."
+                            finirPorte(porte)
+                        },
+                        onPontVu = { id ->
+                            if (pontDuSoir == null) {
+                                soiree.montrerPont(id)
+                                pontDuSoir = id
+                                journal.note("pont_vu", "concept" to id)
+                            }
+                        },
+                        onCarrefourVu = {
+                            carrefoursVus += 1
+                            soiree.carrefoursVus = carrefoursVus
+                        },
                         onLireAncienne = {
                             journal.note("regeneration_annulee", "type" to "suite")
                             tache?.cancel()
                             regen = null
                         },
-                        onFin = {
-                            progression.marquerVus(porte)
-                            progression.marquerLotConsomme()
-                            onConceptsExplores(porte.concepts)
-                            conceptsDuSoir = porte.concepts
-                            nouvellesFeuilles = porte.concepts.map { it.id }.toSet()
-                            journal.note("fil_termine", "porte" to porte.id)
-                            etape = Etape.Recap
-                        },
+                        onFin = { finirPorte(porte) },
                     )
                 }
 
                 Etape.Recap -> EcranRecap(
                     concepts = conceptsDuSoir,
+                    porte = porteDuRecap,
+                    note = porteDuRecap?.let { progression.note(lot.jour, it.id) },
                     teaser = lot.teaserDemain,
                     terrier = progression.tous(),
                     aime = coeurs::conceptAime,
                     nouvelles = nouvellesFeuilles,
-                    autrePorte = autrePorteLibelle(peutAutrePorte, ouvertes.size),
+                    autrePorte = autrePorteLibelle(peutAutrePorte, comptees(ouvertes)),
+                    onNote = noter,
                     onAutrePorte = allerAutrePorte,
                     onBonneNuit = direBonneNuit,
                 )
 
                 Etape.AutrePorte -> EcranAutrePorte(
                     restantes = restantes,
-                    ouvertes = ouvertes.size,
+                    ouvertes = comptees(ouvertes),
                     plafondAtteint = plafondAtteint,
                     bonus = bonus,
                     onChoix = { ouvrirPorte(it) },
@@ -472,7 +633,7 @@ fun ChevetApp(
                     teaser = lot.teaserDemain,
                     terrier = progression.tous(),
                     aime = coeurs::conceptAime,
-                    autrePorte = autrePorteLibelle(peutAutrePorte, ouvertes.size),
+                    autrePorte = autrePorteLibelle(peutAutrePorte, comptees(ouvertes)),
                     onAutrePorte = allerAutrePorte,
                     onBonneNuit = direBonneNuit,
                 )
@@ -526,7 +687,7 @@ fun ChevetApp(
                         etape == Etape.Fil -> "Finis d'abord ta porte en cours"
                         ouvertes.isEmpty() -> "Après ta première porte"
                         plafondAtteint -> "Plafond atteint : $PLAFOND_PORTES portes ce soir"
-                        else -> "${restantes.size} restante${if (restantes.size > 1) "s" else ""}, ou 3 neuves · ${ouvertes.size}/$PLAFOND_PORTES ce soir"
+                        else -> "${restantes.size} restante${if (restantes.size > 1) "s" else ""}, ou 3 neuves · ${comptees(ouvertes)}/$PLAFOND_PORTES ce soir"
                     },
                     autrePortePossible = peutAutrePorte,
                 ),
@@ -552,6 +713,7 @@ fun ChevetApp(
                     onCreuse = { creusagesFaits += 1 },
                     onQuitter = {
                         journal.note("quitter_menu")
+                        if (etape == Etape.Fil && !marqueGardee) garderMarquePage(explicite = false)
                         onQuitter()
                     },
                 ),
@@ -734,10 +896,16 @@ private fun EcranPepite(pepite: Carte, onSuite: () -> Unit) {
 @Composable
 private fun EcranPortes(
     portes: List<Porte>,
+    jour: String,
+    ouvertes: Set<String>,
     bandeau: String?,
     preparation: Preparation?,
     onChoix: (Porte) -> Unit,
 ) {
+    // La reprise d'hier s'affiche en tête, à part ; les portes bonus d'un soir précédent de la
+    // journée s'ajoutent au lot : on garde les 3 du matin.
+    val reprise = portes.firstOrNull { it.reprise && it.id !in ouvertes }
+    val regulieres = portes.filter { !it.reprise }.take(3)
     Colonne {
         Spacer(Modifier.height(40.dp))
         if (bandeau != null) {
@@ -753,27 +921,78 @@ private fun EcranPortes(
             )
             Spacer(Modifier.height(12.dp))
         }
+        if (reprise != null) {
+            CartePorte(reprise, jour, enTete = true) { onChoix(reprise) }
+            Spacer(Modifier.height(14.dp))
+        }
         Etiquette("Ce soir")
         Spacer(Modifier.height(6.dp))
-        Text("Trois portes. Laquelle tu pousses ?", color = Encre, style = MaterialTheme.typography.headlineSmall)
+        Text(
+            when (regulieres.size) {
+                1 -> "Une porte. Tu la pousses ?"
+                2 -> "Deux portes. Laquelle tu pousses ?"
+                else -> "Trois portes. Laquelle tu pousses ?"
+            },
+            color = Encre,
+            style = MaterialTheme.typography.headlineSmall,
+        )
         Spacer(Modifier.height(20.dp))
-        // Les portes bonus d'un soir précédent de la journée s'ajoutent au lot : on garde les 3 du matin.
-        portes.take(3).forEach { porte ->
-            CartePorte(porte.titre, porte.accroche, porte.mystere, porte.indice) { onChoix(porte) }
+        regulieres.forEach { porte ->
+            CartePorte(porte, jour) { onChoix(porte) }
         }
     }
 }
 
+/** Il y a combien d'années, jour pour jour, pour une porte éphéméride. */
+private fun ilYaAns(porte: Porte, jour: String): Int? {
+    val annee = porte.ephemeride?.annee ?: return null
+    val maintenant = jour.take(4).toIntOrNull() ?: return null
+    return (maintenant - annee).takeIf { it > 0 }
+}
+
 @Composable
-private fun CartePorte(titre: String, accroche: String, mystere: Boolean, indice: String?, onClick: () -> Unit) {
+private fun CartePorte(porte: Porte, jour: String, enTete: Boolean = false, onClick: () -> Unit) {
+    CartePorte(
+        titre = porte.titre,
+        accroche = porte.accroche,
+        mystere = porte.mystere,
+        indice = porte.indice,
+        etiquette = when {
+            porte.reprise -> "Reprendre là où tu t'es arrêté"
+            else -> ilYaAns(porte, jour)?.let { "Il y a $it ans, jour pour jour" }
+        },
+        detail = porte.ephemeride?.evenement?.takeIf { it.isNotBlank() && !porte.reprise },
+        bordure = if (enTete) Ambre.copy(alpha = 0.7f) else null,
+        onClick = onClick,
+    )
+}
+
+@Composable
+private fun CartePorte(
+    titre: String,
+    accroche: String,
+    mystere: Boolean,
+    indice: String?,
+    etiquette: String? = null,
+    detail: String? = null,
+    bordure: Color? = null,
+    onClick: () -> Unit,
+) {
     Panneau(
         Modifier
             .padding(vertical = 6.dp)
+            .then(if (bordure != null) Modifier.border(1.dp, bordure, RoundedCornerShape(16.dp)) else Modifier)
             .clickable(onClick = onClick),
     ) {
-        if (mystere) {
-            Etiquette("Porte mystère")
+        if (etiquette != null) {
+            Etiquette(etiquette)
             Spacer(Modifier.height(6.dp))
+        }
+        if (mystere) {
+            if (etiquette == null) {
+                Etiquette("Porte mystère")
+                Spacer(Modifier.height(6.dp))
+            }
             Text(
                 indice ?: "…",
                 color = Encre,
@@ -789,6 +1008,10 @@ private fun CartePorte(titre: String, accroche: String, mystere: Boolean, indice
             )
             Spacer(Modifier.height(6.dp))
             Text(accroche, color = EncreDouce, style = MaterialTheme.typography.bodyMedium)
+        }
+        if (detail != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(detail, color = EncreDouce.copy(alpha = 0.75f), fontSize = 12.sp, fontStyle = FontStyle.Italic)
         }
     }
 }
@@ -840,7 +1063,7 @@ private fun ColumnScope.ChoixAutrePorte(
         Etiquette("Les portes de ce soir")
         Spacer(Modifier.height(4.dp))
         restantes.forEach { porte ->
-            CartePorte(porte.titre, porte.accroche, porte.mystere, porte.indice) { onChoix(porte) }
+            CartePorte(porte, "") { onChoix(porte) }
         }
         Spacer(Modifier.height(16.dp))
     }
@@ -910,419 +1133,19 @@ private fun ColumnScope.ChoixAutrePorte(
     }
 }
 
-// ---------------------------------------------------------------- Fil de cartes
-
-private sealed interface Page {
-    val concept: Concept
-
-    data class Question(override val concept: Concept) : Page
-    data class Texte(override val concept: Concept, val carte: Carte, val numero: Int) : Page
-    data class ARetenir(override val concept: Concept) : Page
-
-    /** La suite se réécrit : page d'attente après le dernier concept gardé. */
-    data class Attente(override val concept: Concept) : Page
-}
-
-private enum class Action(val libelle: String, val icone: ImageVector, val code: String, val retour: String) {
-    Jaime("J'aime", Icons.Filled.FavoriteBorder, "like", "Noté : plus de ce genre"),
-    Bof("Bof", Icons.Filled.Close, "pas_pour_moi", "Noté : moins de ce genre"),
-    Creuser("Creuser", Icons.Filled.Search, "creuser", ""),
-    JeSavais("Je savais", Icons.Filled.Check, "je_savais", "Noté : on montera d'un cran"),
-    Dense("Trop dense", Icons.Filled.Info, "trop_dense", "Noté : on simplifiera"),
-    Signaler("Signaler", Icons.Filled.Warning, "signaler", "Carte signalée"),
-    Partager("Partager", Icons.Filled.Share, "partager", ""),
-}
-
-@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
-@Composable
-private fun EcranFil(
-    porte: Porte,
-    attente: Regen.Suite?,
-    journal: Journal,
-    coeurs: Coeurs,
-    creusagesRestants: Int,
-    creusagesParSoir: Int,
-    creuser: suspend (Concept, String) -> String,
-    onCreuser: () -> Unit,
-    onCoeur: (Concept, Int, String) -> Unit,
-    onTropDense: () -> Unit,
-    onPartager: (String) -> Unit,
-    onProgres: (Float) -> Unit,
-    onConcept: (Int) -> Unit,
-    onLireAncienne: () -> Unit,
-    onFin: () -> Unit,
-) {
-    // Pendant la réécriture de la suite, seuls les concepts gardés restent, suivis d'une page d'attente.
-    val pages = remember(porte, attente?.gardes) {
-        val concepts = if (attente != null) porte.concepts.take(attente.gardes) else porte.concepts
-        val base = concepts.flatMap { c ->
-            listOf<Page>(Page.Question(c)) +
-                c.cartes.mapIndexed { i, carte -> Page.Texte(c, carte, i) } +
-                Page.ARetenir(c)
-        }
-        if (attente != null && concepts.isNotEmpty()) base + Page.Attente(concepts.last()) else base
-    }
-    val pagesActuelles by rememberUpdatedState(pages)
-    val porteActuelle by rememberUpdatedState(porte)
-    val etatPager = rememberPagerState(pageCount = { pages.size })
-    var message by remember { mutableStateOf<String?>(null) }
-    var voletCreuser by remember { mutableStateOf(false) }
-    val uri = LocalUriHandler.current
-
-    // Journal : temps passé sur chaque carte, progression de la nuit et concept en cours.
-    LaunchedEffect(etatPager) {
-        var precedente = etatPager.currentPage
-        var debut = System.currentTimeMillis()
-        snapshotFlow { etatPager.currentPage }.collect { page ->
-            val liste = pagesActuelles
-            val maintenant = System.currentTimeMillis()
-            if (page != precedente && precedente in liste.indices) {
-                journal.note(
-                    "carte_vue",
-                    "concept" to liste[precedente].concept.id,
-                    "page" to precedente,
-                    "duree_ms" to (maintenant - debut),
-                )
-            }
-            precedente = page
-            debut = maintenant
-            onProgres((page + 1).toFloat() / liste.size.coerceAtLeast(1))
-            liste.getOrNull(page)?.let { p ->
-                val index = porteActuelle.concepts.indexOfFirst { it.id == p.concept.id }
-                if (index >= 0) onConcept(index)
-            }
-        }
-    }
-
-    LaunchedEffect(message) {
-        if (message != null) {
-            delay(1600)
-            message = null
-        }
-    }
-
-    val pageCourante = pages[etatPager.currentPage.coerceIn(0, pages.lastIndex)]
-    val concept = pageCourante.concept
-    // Le cœur se pose sur la page affichée : une carte, la phrase à retenir (-1) ou la question (-2).
-    val cibleCoeur: Pair<Int, String>? = when (pageCourante) {
-        is Page.Texte -> pageCourante.numero to pageCourante.carte.texte
-        is Page.ARetenir -> -1 to concept.aRetenir
-        is Page.Question -> -2 to concept.question
-        is Page.Attente -> null
-    }
-    val aimee = cibleCoeur != null && coeurs.aime(concept.id, cibleCoeur.first)
-
-    Column(Modifier.fillMaxSize().systemBarsPadding()) {
-        Box(Modifier.weight(1f)) {
-            VerticalPager(state = etatPager, modifier = Modifier.fillMaxSize()) { i ->
-                val page = pages.getOrNull(i)
-                when {
-                    page == null -> {}
-                    page is Page.Attente -> PageAttente(porte.titre, attente?.preparation, onLireAncienne)
-                    else -> PageCarte(
-                        page = page,
-                        estDerniere = i == pages.lastIndex,
-                        onFin = onFin,
-                        onSource = { url -> runCatching { uri.openUri(url) } },
-                    )
-                }
-            }
-            message?.let { texte ->
-                Text(
-                    texte,
-                    color = Encre,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 12.dp)
-                        .background(Voile, RoundedCornerShape(50))
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                )
-            }
-        }
-        BarreActions(aimee = aimee) { action ->
-            when (action) {
-                Action.Jaime -> {
-                    // Le journal note « like » ou « unlike » au moment de basculer.
-                    val (carte, texte) = cibleCoeur ?: return@BarreActions
-                    onCoeur(concept, carte, texte)
-                    if (!aimee) message = action.retour
-                }
-                Action.Creuser -> {
-                    journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
-                    voletCreuser = true
-                }
-                Action.Partager -> {
-                    journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
-                    onPartager("${concept.aRaconter}\n\n(via Chevet)")
-                }
-                Action.Dense -> {
-                    journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
-                    message = action.retour
-                    onTropDense()
-                }
-                else -> {
-                    journal.note(action.code, "concept" to concept.id, "page" to etatPager.currentPage)
-                    message = action.retour
-                }
-            }
-        }
-    }
-
-    if (voletCreuser) {
-        ModalBottomSheet(
-            onDismissRequest = { voletCreuser = false },
-            containerColor = Color(0xFF1A1630),
-        ) {
-            VoletCreuser(
-                concept = concept,
-                restants = creusagesRestants,
-                parSoir = creusagesParSoir,
-                creuser = creuser,
-                onCreuser = { question ->
-                    journal.note("creuser_question", "concept" to concept.id, "question" to question)
-                    onCreuser()
-                },
-                onFermer = { voletCreuser = false },
-            )
-        }
-    }
-}
-
-@Composable
-private fun PageCarte(page: Page, estDerniere: Boolean, onFin: () -> Unit, onSource: (String) -> Unit) {
-    val c = page.concept
-    Column(
-        Modifier
-            .fillMaxSize()
-            .padding(horizontal = 24.dp, vertical = 24.dp),
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Panneau {
-            when (page) {
-                is Page.Question -> {
-                    Etiquette(c.theme)
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        c.titre,
-                        color = Encre,
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Spacer(Modifier.height(16.dp))
-                    Text(
-                        c.question,
-                        color = Encre,
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontStyle = FontStyle.Italic,
-                    )
-                }
-
-                is Page.Texte -> {
-                    Etiquette("${c.titre} · ${page.numero + 1}/${c.cartes.size}")
-                    Spacer(Modifier.height(12.dp))
-                    Text(page.carte.texte, color = Encre, style = MaterialTheme.typography.titleLarge)
-                }
-
-                is Page.Attente -> Unit
-
-                is Page.ARetenir -> {
-                    if (c.aRetenir.isNotBlank()) {
-                        Etiquette("À retenir")
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            c.aRetenir,
-                            color = Encre,
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                        )
-                    }
-                    c.ordreDeGrandeur?.takeIf { it.isNotBlank() }?.let { chiffre ->
-                        Spacer(Modifier.height(12.dp))
-                        Text(chiffre, color = Ambre, style = MaterialTheme.typography.bodyLarge)
-                    }
-                    if (c.aRaconter.isNotBlank()) {
-                        Spacer(Modifier.height(16.dp))
-                        Etiquette("À raconter")
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            c.aRaconter,
-                            color = EncreDouce,
-                            style = MaterialTheme.typography.bodyLarge,
-                            fontStyle = FontStyle.Italic,
-                        )
-                    }
-                }
-            }
-            Spacer(Modifier.height(16.dp))
-            Text(
-                "Source : ${c.source.titre}",
-                color = EncreDouce.copy(alpha = 0.7f),
-                fontSize = 12.sp,
-                modifier = Modifier.clickable { onSource(c.source.url) },
-            )
-        }
-
-        if (estDerniere) {
-            Spacer(Modifier.height(24.dp))
-            Button(onClick = onFin, modifier = Modifier.fillMaxWidth()) { Text("Voir le récap") }
-        } else if (page is Page.Question) {
-            Spacer(Modifier.height(16.dp))
-            Text(
-                "Glisse vers le haut",
-                color = EncreDouce.copy(alpha = 0.6f),
-                fontSize = 12.sp,
-                modifier = Modifier.align(Alignment.CenterHorizontally),
-            )
-        }
-    }
-}
-
-@Composable
-private fun PageAttente(titrePorte: String, preparation: Preparation?, onLireAncienne: () -> Unit) {
-    Column(
-        Modifier
-            .fillMaxSize()
-            .padding(horizontal = 24.dp, vertical = 24.dp),
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Panneau {
-            Etiquette("La suite se réécrit")
-            Spacer(Modifier.height(12.dp))
-            Text(
-                "Le conteur réécrit la suite de « $titrePorte » avec tes nouveaux réglages.",
-                color = Encre,
-                style = MaterialTheme.typography.titleLarge,
-            )
-            Spacer(Modifier.height(20.dp))
-            val p = preparation ?: Preparation(0, 4)
-            LinearProgressIndicator(
-                progress = { p.etape.toFloat() / p.total.coerceAtLeast(1) },
-                modifier = Modifier.fillMaxWidth(),
-                color = Ambre,
-                trackColor = Voile,
-            )
-            Spacer(Modifier.height(8.dp))
-            Text("Étape ${p.etape} sur ${p.total}", color = EncreDouce, style = MaterialTheme.typography.bodyMedium)
-        }
-        Spacer(Modifier.height(20.dp))
-        OutlinedButton(onClick = onLireAncienne, modifier = Modifier.fillMaxWidth()) {
-            Text("Lire l'ancienne version", color = Encre)
-        }
-    }
-}
-
-@Composable
-private fun BarreActions(aimee: Boolean, onAction: (Action) -> Unit) {
-    // Le cœur se remplit avec un petit rebond.
-    val rebond by animateFloatAsState(if (aimee) 1f else 0f, label = "coeur")
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .background(Voile)
-            .padding(vertical = 8.dp),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-    ) {
-        Action.entries.forEach { action ->
-            val coeur = action == Action.Jaime
-            Column(
-                Modifier
-                    .clickable { onAction(action) }
-                    .padding(4.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                if (coeur) {
-                    val echelle = 1f + 0.3f * kotlin.math.sin(rebond * Math.PI.toFloat())
-                    Icon(
-                        if (aimee) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                        contentDescription = if (aimee) "Retirer le cœur" else action.libelle,
-                        tint = if (aimee) Ambre else Encre,
-                        modifier = Modifier.size((24 * echelle).dp),
-                    )
-                } else {
-                    Icon(action.icone, contentDescription = action.libelle, tint = Encre)
-                }
-                Text(action.libelle, color = if (coeur && aimee) Ambre else EncreDouce, fontSize = 10.sp)
-            }
-        }
-    }
-}
-
-@Composable
-internal fun VoletCreuser(
-    concept: Concept,
-    restants: Int,
-    parSoir: Int,
-    creuser: suspend (Concept, String) -> String,
-    onCreuser: (String) -> Unit,
-    onFermer: () -> Unit,
-) {
-    var question by remember { mutableStateOf<String?>(null) }
-    var reponseIa by remember { mutableStateOf<String?>(null) }
-    val portee = rememberCoroutineScope()
-    val suggestions = concept.creuser.ifEmpty { questionsSuggerees(concept) }
-
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 24.dp, vertical = 8.dp)
-            .navigationBarsPadding()
-            .verticalScroll(rememberScrollState()),
-    ) {
-        Etiquette("Creuser · $restants/$parSoir ce soir")
-        Spacer(Modifier.height(12.dp))
-        val choisie = question
-        when {
-            choisie != null -> {
-                Text(choisie, color = Encre, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    reponseIa ?: "Le conteur réfléchit…",
-                    color = if (reponseIa == null) EncreDouce else Encre,
-                    style = MaterialTheme.typography.bodyLarge,
-                )
-            }
-
-            restants <= 0 -> Text(
-                "Quota du soir atteint. Ta question attendra demain : elle pourra devenir une porte.",
-                color = EncreDouce,
-            )
-
-            else -> suggestions.forEach { q ->
-                OutlinedButton(
-                    onClick = {
-                        question = q
-                        onCreuser(q)
-                        portee.launch { reponseIa = creuser(concept, q) }
-                    },
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                ) {
-                    Text(q, color = Encre)
-                }
-            }
-        }
-        Spacer(Modifier.height(16.dp))
-        TextButton(onClick = onFermer) { Text("Fermer", color = EncreDouce) }
-        Spacer(Modifier.height(16.dp))
-    }
-}
-
-/** Questions de secours quand le lot n'en propose pas. */
-internal fun questionsSuggerees(c: Concept) = listOf(
-    "D'où vient « ${c.titre} » ?",
-    "Un exemple concret, près de chez moi ?",
-    "Et aujourd'hui, où en est-on ?",
-)
-
 // ---------------------------------------------------------------- Récap et fin
 
 @Composable
 private fun EcranRecap(
     concepts: List<Concept>,
+    porte: Porte?,
+    note: Int?,
     teaser: String,
     terrier: List<ConceptVu>,
     aime: (String) -> Boolean,
     nouvelles: Set<String>,
     autrePorte: String?,
+    onNote: (Porte, Int) -> Unit,
     onAutrePorte: () -> Unit,
     onBonneNuit: () -> Unit,
 ) {
@@ -1332,13 +1155,80 @@ private fun EcranRecap(
         Spacer(Modifier.height(12.dp))
         concepts.filter { it.aRetenir.isNotBlank() }.forEach { c ->
             Text(
-                "• ${c.aRetenir}",
-                color = Encre,
+                (if (c.estCran) "↳ " else "• ") + c.aRetenir,
+                color = if (c.estCran) EncreDouce else Encre,
                 style = MaterialTheme.typography.bodyLarge,
-                modifier = Modifier.padding(vertical = 4.dp),
+                modifier = Modifier.padding(vertical = 4.dp, horizontal = if (c.estCran) 12.dp else 0.dp),
             )
         }
+        if (porte != null) {
+            Spacer(Modifier.height(20.dp))
+            NoteDePorte(porte, note) { onNote(porte, it) }
+        }
         FinDeSoiree(teaser, terrier, aime, nouvelles, autrePorte, onAutrePorte, onBonneNuit)
+    }
+}
+
+/**
+ * La note de la porte, de 1 à 10, facultative : deux rangées de 5 pastilles sous le pouce,
+ * et « passer ». Une note de 8 ou plus annonce que sa suite attendra demain.
+ */
+@Composable
+private fun ColumnScope.NoteDePorte(porte: Porte, noteInitiale: Int?, onNote: (Int) -> Unit) {
+    var note by remember(porte.id) { mutableStateOf(noteInitiale) }
+    var passee by remember(porte.id) { mutableStateOf(false) }
+    if (passee && note == null) return
+    Etiquette("Ta note pour cette porte")
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "« ${porte.titre} »",
+        color = EncreDouce,
+        style = MaterialTheme.typography.bodyMedium,
+        fontStyle = FontStyle.Italic,
+    )
+    Spacer(Modifier.height(10.dp))
+    listOf(1..5, 6..10).forEach { rangee ->
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+            rangee.forEach { n ->
+                val choisie = note == n
+                Box(
+                    Modifier
+                        .padding(4.dp)
+                        .size(44.dp)
+                        .background(if (choisie) Ambre else Voile, CircleShape)
+                        .border(1.dp, Ambre.copy(alpha = if (choisie) 1f else 0.35f), CircleShape)
+                        .clickable {
+                            note = n
+                            onNote(n)
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "$n",
+                        color = if (choisie) Color(0xFF2A1A10) else Encre,
+                        fontWeight = if (choisie) FontWeight.Bold else FontWeight.Normal,
+                    )
+                }
+            }
+        }
+    }
+    val n = note
+    when {
+        n == null -> TextButton(onClick = { passee = true }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+            Text("Passer", color = EncreDouce)
+        }
+        n >= 8 -> Text(
+            "Sa suite t'attendra demain.",
+            color = Ambre,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 6.dp),
+        )
+        else -> Text(
+            "Noté.",
+            color = EncreDouce,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 6.dp),
+        )
     }
 }
 
