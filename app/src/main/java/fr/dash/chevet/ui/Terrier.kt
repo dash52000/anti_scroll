@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.sp
 import fr.dash.chevet.data.ConceptVu
 import fr.dash.chevet.data.Voisin
+import fr.dash.chevet.model.Sens
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
@@ -101,11 +102,23 @@ private class Feuille(
     val aimee: Boolean,
 )
 
+/** Un cran (« plus loin », « à côté ») dessiné en racine sous l'arbre : de son départ jusqu'à lui. */
+private class Racine(
+    val id: String,
+    val de: Offset,
+    val vers: Offset,
+    val theme: String,
+    val plusLoin: Boolean,
+)
+
 private class DessinArbre(
     val tronc: Rameau,
     val rameaux: List<Rameau>,
     val feuilles: List<Feuille>,
     val etiquettes: List<Pair<String, Offset>>,
+    /** Hauteur du sol, en part de la hauteur : plus haut quand des racines poussent dessous. */
+    val sol: Float,
+    val racines: List<Racine>,
 )
 
 /**
@@ -113,11 +126,15 @@ private class DessinArbre(
  * quand une branche se charge, une feuille par concept. Tout est déterministe : une feuille garde
  * sa place d'un soir à l'autre.
  */
-private fun disposerArbre(concepts: List<ConceptVu>, taille: Size, unite: Float, aime: (String) -> Boolean): DessinArbre {
+private fun disposerArbre(tous: List<ConceptVu>, taille: Size, unite: Float, aime: (String) -> Boolean): DessinArbre {
     val l = taille.width
     val h = taille.height
-    val pied = Offset(l / 2, h * 0.97f)
-    val cime = Offset(l / 2, h * 0.56f)
+    // Les concepts des portes sont des feuilles ; les crans poussent en racines sous le sol.
+    val concepts = tous.filter { !it.concept.estCran }
+    val avecRacines = tous.any { it.concept.estCran }
+    val sol = if (avecRacines) 0.80f else 0.97f
+    val pied = Offset(l / 2, h * sol)
+    val cime = Offset(l / 2, h * (sol - 0.41f))
     val epaisseurTronc = unite * (5f + min(9f, concepts.size / 6f))
     val tronc = Rameau(pied, Offset(l / 2 + unite * 4, (pied.y + cime.y) / 2), cime, epaisseurTronc)
 
@@ -182,7 +199,47 @@ private fun disposerArbre(concepts: List<ConceptVu>, taille: Size, unite: Float,
             )
         }
     }
-    return DessinArbre(tronc, rameaux, feuilles, etiquettes)
+    return DessinArbre(tronc, rameaux, feuilles, etiquettes, sol, disposerRacines(tous, pied, taille, unite))
+}
+
+/**
+ * Les racines : chaque cran part de son concept de départ. Un cran de premier niveau part du pied
+ * de l'arbre, décalé selon le thème ; « plus loin » descend, « à côté » s'écarte sur le côté.
+ */
+private fun disposerRacines(tous: List<ConceptVu>, pied: Offset, taille: Size, unite: Float): List<Racine> {
+    val crans = tous.filter { it.concept.estCran }
+    if (crans.isEmpty()) return emptyList()
+    val parId = tous.associateBy { it.concept.id }
+    val bas = taille.height * 0.985f
+    val pas = ((bas - pied.y) / 4f).coerceAtLeast(unite * 6)
+    val positions = mutableMapOf<String, Offset>()
+    val racines = mutableListOf<Racine>()
+    val enCours = mutableSetOf<String>()
+
+    fun position(vu: ConceptVu): Offset {
+        val id = vu.concept.id
+        positions[id]?.let { return it }
+        val r = Random(id.hashCode().toLong())
+        val parent = vu.concept.depuis?.let { parId[it] }
+        val depart = if (parent != null && parent.concept.estCran && enCours.add(id)) {
+            position(parent)
+        } else {
+            val t = indexTheme(parent?.concept?.theme ?: vu.concept.theme)
+            Offset(pied.x + (t - 1.5f) * unite * 16 + (r.nextFloat() - 0.5f) * unite * 8, pied.y)
+        }
+        val brut = if (vu.concept.sens == Sens.PLUS_LOIN) {
+            Offset(depart.x + (r.nextFloat() - 0.5f) * unite * 10, depart.y + pas)
+        } else {
+            val cote = if (r.nextBoolean()) 1f else -1f
+            Offset(depart.x + cote * unite * (16f + 8f * r.nextFloat()), depart.y + pas * 0.45f)
+        }
+        val p = Offset(brut.x.coerceIn(unite * 6, taille.width - unite * 6), brut.y.coerceAtMost(bas))
+        positions[id] = p
+        racines += Racine(id, depart, p, vu.concept.theme, vu.concept.sens == Sens.PLUS_LOIN)
+        return p
+    }
+    crans.forEach { position(it) }
+    return racines
 }
 
 private fun couleursFeuilles(s: Saison): List<Color> = when (s) {
@@ -222,8 +279,9 @@ internal fun Arbre(
         Modifier.pointerInput(concepts) {
             detectTapGestures { p ->
                 val d = dernier.valeur ?: return@detectTapGestures
-                val proche = d.feuilles.minByOrNull { (it.centre - p).getDistance() }
-                if (proche != null && (proche.centre - p).getDistance() < 22 * density) onFeuille(proche.id)
+                val points = d.feuilles.map { it.id to it.centre } + d.racines.map { it.id to it.vers }
+                val proche = points.minByOrNull { (it.second - p).getDistance() }
+                if (proche != null && (proche.second - p).getDistance() < 22 * density) onFeuille(proche.first)
             }
         }
     } else {
@@ -236,12 +294,36 @@ internal fun Arbre(
         dernier.valeur = dessin
         val ecorce = Color(0xFF3B2A26)
 
+        // Sous le sol, la terre où poussent les racines (les crans).
+        if (dessin.racines.isNotEmpty()) {
+            drawRect(
+                Color(0xFF120E1E).copy(alpha = 0.55f),
+                topLeft = Offset(0f, size.height * dessin.sol),
+                size = Size(size.width, size.height * (1f - dessin.sol)),
+            )
+        }
+
         // Butte au pied de l'arbre.
         drawOval(
             Color(0xFF1B1530).copy(alpha = 0.85f),
-            topLeft = Offset(size.width * 0.18f, size.height * 0.93f),
+            topLeft = Offset(size.width * 0.18f, size.height * (dessin.sol - 0.04f)),
             size = Size(size.width * 0.64f, size.height * 0.12f),
         )
+
+        // Les racines : puits vers le bas (« plus loin »), galeries sur les côtés (« à côté »).
+        dessin.racines.forEach { r ->
+            val rang = ordreNouvelles.indexOf(r.id)
+            val echelle = if (rang < 0) 1f else (pousse.value * (ordreNouvelles.size + 1) - rang).coerceIn(0f, 1f)
+            if (echelle <= 0f) return@forEach
+            val bout = Offset(r.de.x + (r.vers.x - r.de.x) * echelle, r.de.y + (r.vers.y - r.de.y) * echelle)
+            val chemin = Path().apply {
+                moveTo(r.de.x, r.de.y)
+                quadraticTo(if (r.plusLoin) r.de.x else bout.x, if (r.plusLoin) (r.de.y + bout.y) / 2 else r.de.y, bout.x, bout.y)
+            }
+            drawPath(chemin, Color(0xFF6B4C40).copy(alpha = 0.9f), style = Stroke(width = unite * 1.6f, cap = StrokeCap.Round))
+            drawCircle(couleurTheme(r.theme), radius = unite * 3.4f * echelle, center = bout)
+            if (aime(r.id)) drawCircle(Ambre, radius = unite * 4.8f * echelle, center = bout, style = Stroke(unite * 1.1f))
+        }
 
         rameau(dessin.tronc, ecorce)
         dessin.rameaux.forEach { rameau(it, ecorce) }
@@ -334,14 +416,29 @@ private fun DrawScope.fleur(centre: Offset, unite: Float) {
 
 // ---------------------------------------------------------------- Graphe du terrier
 
-/** Les liens du graphe : chaque concept est relié au précédent de sa porte. */
-internal fun liensDuTerrier(concepts: List<ConceptVu>): List<Pair<String, String>> {
-    val liens = mutableListOf<Pair<String, String>>()
+/** Un lien du graphe ; [pont] : un fil doré vers un concept vu plus d'une semaine plus tôt. */
+internal data class Lien(val a: String, val b: String, val pont: Boolean = false)
+
+/**
+ * Les liens du graphe : chaque concept d'une porte est relié au précédent de sa porte, chaque cran
+ * à son concept de départ, et chaque pont au concept qu'il rappelle.
+ */
+internal fun liensDuTerrier(concepts: List<ConceptVu>): List<Lien> {
+    val liens = mutableListOf<Lien>()
+    val ids = concepts.map { it.concept.id }.toSet()
     // Les concepts d'avant le menu n'ont pas de porte : ceux d'un même soir formaient un seul tunnel.
-    val groupes = concepts.groupBy { it.porte ?: "soir:${it.vuLe}" }
+    val groupes = concepts.filter { !it.concept.estCran }.groupBy { it.porte ?: "soir:${it.vuLe}" }
     groupes.values.forEach { groupe ->
         val ordonne = if (groupe.first().porte != null) groupe.sortedBy { it.rang } else groupe
-        ordonne.zipWithNext { a, b -> liens += a.concept.id to b.concept.id }
+        ordonne.zipWithNext { a, b -> liens += Lien(a.concept.id, b.concept.id) }
+    }
+    concepts.filter { it.concept.estCran }.forEach { vu ->
+        val depart = vu.concept.depuis
+        if (depart != null && depart in ids) liens += Lien(depart, vu.concept.id)
+    }
+    concepts.forEach { vu ->
+        val pont = vu.concept.pont ?: return@forEach
+        if (pont.avecId in ids && pont.avecId != vu.concept.id) liens += Lien(pont.avecId, vu.concept.id, pont = true)
     }
     return liens
 }
@@ -351,7 +448,7 @@ internal fun liensDuTerrier(concepts: List<ConceptVu>): List<Pair<String, String
  * repoussent, et une légère gravité vers le coin de leur thème regroupe les thèmes.
  * Coordonnées autour de 0, dans un carré de côté 2 environ.
  */
-private fun disposerGraphe(concepts: List<ConceptVu>, liens: List<Pair<String, String>>): Map<String, Offset> {
+private fun disposerGraphe(concepts: List<ConceptVu>, liens: List<Lien>): Map<String, Offset> {
     val n = concepts.size
     if (n == 0) return emptyMap()
     val index = concepts.withIndex().associate { (i, c) -> c.concept.id to i }
@@ -368,7 +465,7 @@ private fun disposerGraphe(concepts: List<ConceptVu>, liens: List<Pair<String, S
         x[i] = a.x + (r.nextFloat() - 0.5f) * 0.6f
         y[i] = a.y + (r.nextFloat() - 0.5f) * 0.6f
     }
-    val aretes = liens.mapNotNull { (a, b) -> index[a]?.let { i -> index[b]?.let { j -> i to j } } }
+    val aretes = liens.mapNotNull { l -> index[l.a]?.let { i -> index[l.b]?.let { j -> i to j } } }
     val k = sqrt(4f / n).coerceAtMost(0.6f)
     var temperature = 0.25f
     val iterations = if (n > 200) 160 else 300
@@ -479,10 +576,15 @@ internal fun Graphe(
         if (positions.isEmpty()) return@Canvas
         val unite = density
 
-        liens.forEach { (a, b) ->
-            val pa = positions[a] ?: return@forEach
-            val pb = positions[b] ?: return@forEach
-            drawLine(Encre.copy(alpha = 0.22f), ecran(pa, size), ecran(pb, size), strokeWidth = unite * 1.4f)
+        // Les liens ordinaires d'abord, les ponts dorés par-dessus.
+        liens.sortedBy { it.pont }.forEach { l ->
+            val pa = positions[l.a] ?: return@forEach
+            val pb = positions[l.b] ?: return@forEach
+            if (l.pont) {
+                drawLine(Dore.copy(alpha = 0.85f), ecran(pa, size), ecran(pb, size), strokeWidth = unite * 2.2f, cap = StrokeCap.Round)
+            } else {
+                drawLine(Encre.copy(alpha = 0.22f), ecran(pa, size), ecran(pb, size), strokeWidth = unite * 1.4f)
+            }
         }
 
         val etiquettesVisibles = concepts.size <= 25 || zoom >= 1.6f

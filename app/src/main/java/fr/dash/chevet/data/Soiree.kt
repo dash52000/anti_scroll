@@ -113,6 +113,55 @@ class Soiree(context: Context) {
     /** La notif part une heure avant le coucher. */
     fun minutesNotif(): Int = (coucher().minutes - 60 + 1440) % 1440
 
+    /**
+     * Vrai une fois l'heure de coucher passée (et jusqu'au matin) : le carrefour propose alors
+     * « garder pour demain », les crans s'écrivent courts et le ciel fonce plus vite.
+     */
+    fun apresCoucher(maintenant: LocalDateTime = LocalDateTime.now()): Boolean {
+        val heure = maintenant.hour
+        if (heure in 5 until 17) return false
+        var actuel = heure * 60 + maintenant.minute
+        if (heure < 5) actuel += 1440
+        var coucher = coucher().minutes
+        if (coucher < 12 * 60) coucher += 1440
+        return actuel >= coucher
+    }
+
+    // ------------------------------------------------------------ Exploration
+
+    /** La soirée en cours : après minuit, on est encore la veille. */
+    private fun soir(maintenant: LocalDateTime = LocalDateTime.now()): String =
+        (if (maintenant.hour < 5) maintenant.toLocalDate().minusDays(1) else maintenant.toLocalDate()).toString()
+
+    /** Nombre de carrefours déjà vus : les trois premiers, la carte frémit pour montrer qu'elle bouge. */
+    var carrefoursVus: Int
+        get() = prefs.getInt("carrefours_vus", 0)
+        set(v) = prefs.edit().putInt("carrefours_vus", v).apply()
+
+    /** Le concept dont le pont s'affiche ce soir (un pont par soir au plus). */
+    fun pontDuSoir(): String? {
+        val brut = prefs.getString("pont_du_soir", null) ?: return null
+        val (jour, id) = brut.split('|', limit = 2).takeIf { it.size == 2 } ?: return null
+        return id.takeIf { jour == soir() }
+    }
+
+    fun montrerPont(conceptId: String) {
+        prefs.edit().putString("pont_du_soir", "${soir()}|$conceptId").apply()
+    }
+
+    /** Garde le titre de ce qui attend après le marque-page, pour la notif de demain. */
+    fun memoriserMarquePage(titre: String?) {
+        prefs.edit().apply {
+            if (titre.isNullOrBlank()) {
+                remove("marque_page")
+                remove("marque_page_jour")
+            } else {
+                putString("marque_page", titre)
+                putString("marque_page_jour", soir())
+            }
+        }.apply()
+    }
+
     // ------------------------------------------------------------ Contenu de la notif
 
     /** Garde le teaser de demain et la pépite du lot chargé, pour la notif du soir. */
@@ -150,6 +199,12 @@ class Soiree(context: Context) {
         val pepiteJour = prefs.getString("pepite_jour", null)
         val pepiteEnAttente = !pepite.isNullOrBlank() && pepiteJour != prefs.getString("pepite_vue", null)
         if (ignorees >= 2 && pepiteEnAttente) return "Une pépite t'attend : $pepite"
+
+        // Marque-page d'hier soir : la notif repart de là.
+        val marque = prefs.getString("marque_page", null)
+        if (!marque.isNullOrBlank() && prefs.getString("marque_page_jour", null) == aujourdhui.minusDays(1).toString()) {
+            return "Hier, tu t'es arrêté juste avant « $marque ». La suite t'attend, déjà prête."
+        }
 
         val teaser = prefs.getString("teaser", null)
         val teaserJour = prefs.getString("teaser_jour", null)

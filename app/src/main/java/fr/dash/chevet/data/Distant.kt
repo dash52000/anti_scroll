@@ -4,9 +4,14 @@ import android.content.Context
 import fr.dash.chevet.model.Concept
 import fr.dash.chevet.model.Lot
 import fr.dash.chevet.model.Porte
+import fr.dash.chevet.model.Sens
+import fr.dash.chevet.model.TitreCran
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -86,6 +91,33 @@ data class Curiosite(
     @kotlinx.serialization.SerialName("cree_le") val creeLe: String = "",
 )
 
+/**
+ * Les deux sorties d'un concept, telles que le serveur les prépare : les titres arrivent d'abord
+ * (pour les languettes), les concepts écrits et vérifiés ensuite.
+ * [statut] : en_cours, pret, erreur ou indisponible.
+ */
+data class Crans(
+    val statut: String,
+    val titrePlusLoin: TitreCran? = null,
+    val titreACote: TitreCran? = null,
+    val plusLoin: Concept? = null,
+    val aCote: Concept? = null,
+) {
+    val fini: Boolean get() = statut == "pret" || statut == "erreur" || statut == "indisponible"
+
+    fun titre(sens: String): TitreCran? = if (sens == Sens.PLUS_LOIN) titrePlusLoin else titreACote
+
+    fun concept(sens: String): Concept? = if (sens == Sens.PLUS_LOIN) plusLoin else aCote
+
+    /** Vrai si ce côté n'aura jamais de suite : la languette disparaît. */
+    fun impasse(sens: String): Boolean = fini && concept(sens) == null
+
+    companion object {
+        val EN_COURS = Crans("en_cours")
+        val ECHEC = Crans("erreur")
+    }
+}
+
 private const val FONCTION_LOT = "/functions/v1/chevet-lot"
 
 class Distant(context: Context) {
@@ -93,6 +125,13 @@ class Distant(context: Context) {
     private val prefs = context.getSharedPreferences("session", Context.MODE_PRIVATE)
     private val dossier = context.filesDir
     private val json = Json { ignoreUnknownKeys = true }
+
+    /** Pour les envois qui doivent survivre à la fermeture de l'écran (marque-page au « bonne nuit »). */
+    private val fond = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    fun enFond(bloc: suspend () -> Unit) {
+        fond.launch { runCatching { bloc() } }
+    }
 
     /** Pour le profil : les champs absents ou nuls prennent leur valeur par défaut. */
     private val souple = Json {
@@ -465,6 +504,135 @@ class Distant(context: Context) {
             val (code, _) = requete(
                 "POST",
                 "/rest/v1/chevet_concepts?on_conflict=user_id,slug",
+                buildJsonArray { add(ligne) }.toString(),
+                jeton,
+                mapOf("Prefer" to "resolution=merge-duplicates,return=minimal"),
+            )
+            code in 200..299
+        }.getOrDefault(false)
+    }
+
+    // ------------------------------------------------------------ Exploration : plus loin, à côté
+
+    private fun lireCrans(o: JsonObject): Crans {
+        fun titre(cle: String): TitreCran? =
+            (o["titres"] as? JsonObject)?.get(cle)?.let { runCatching { json.decodeFromJsonElement(TitreCran.serializer(), it) }.getOrNull() }
+        fun concept(cle: String): Concept? =
+            o[cle]?.takeIf { it is JsonObject }?.let { runCatching { json.decodeFromJsonElement(Concept.serializer(), it) }.getOrNull() }
+        return Crans(
+            statut = o["statut"]?.jsonPrimitive?.contentOrNull ?: "indisponible",
+            titrePlusLoin = titre(Sens.PLUS_LOIN),
+            titreACote = titre(Sens.A_COTE),
+            plusLoin = concept(Sens.PLUS_LOIN),
+            aCote = concept(Sens.A_COTE),
+        )
+    }
+
+    /**
+     * Prépare « plus loin » et « à côté » depuis [depuis], étape par étape, jusqu'à ce qu'ils soient prêts.
+     * [onEtat] reçoit chaque état (les titres arrivent dès la première étape). [court] : après l'heure
+     * de coucher, des cartes plus courtes. Renvoie le dernier état connu.
+     */
+    suspend fun crans(
+        porte: Porte,
+        depuis: Concept,
+        chemin: List<String>,
+        court: Boolean,
+        onEtat: (Crans) -> Unit,
+    ): Crans = withContext(Dispatchers.IO) {
+        var dernier = Crans.EN_COURS
+        try {
+            val corps = buildJsonObject {
+                put("action", "crans")
+                put("porte", buildJsonObject {
+                    put("titre", porte.titre)
+                    put("accroche", porte.accroche)
+                })
+                put("depuis", buildJsonObject {
+                    put("id", depuis.id)
+                    put("titre", depuis.titre)
+                    put("url", depuis.source.url)
+                    put("theme", depuis.theme)
+                    put("profondeur", depuis.profondeur)
+                })
+                put("chemin", buildJsonArray { chemin.forEach { add(JsonPrimitive(it)) } })
+                put("court", court)
+            }.toString()
+            val debut = System.currentTimeMillis()
+            var echecs = 0
+            while (System.currentTimeMillis() - debut < 8 * 60_000L) {
+                val (code, texte) = requete("POST", FONCTION_LOT, corps, jeton())
+                val o = objet(texte)
+                if (o == null || code !in 200..299) {
+                    if (++echecs >= 3) return@withContext Crans.ECHEC.also { withContext(Dispatchers.Main) { onEtat(it) } }
+                    delay(10_000)
+                    continue
+                }
+                dernier = lireCrans(o)
+                val etat = dernier
+                withContext(Dispatchers.Main) { onEtat(etat) }
+                if (etat.fini) return@withContext etat
+                // Étape occupée ou limite Groq : on souffle avant de relancer.
+                val souffle = o["occupe"] != null || o["erreur"]?.jsonPrimitive?.contentOrNull != null
+                if (souffle) delay(12_000)
+            }
+            dernier
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            Crans.ECHEC.also { withContext(Dispatchers.Main) { onEtat(it) } }
+        }
+    }
+
+    /**
+     * Garde l'endroit où le lecteur s'arrête : le dernier concept lu et les concepts déjà écrits qui
+     * suivent. Le lot de demain en fait la porte « reprise ». [effacer] : la porte est finie.
+     */
+    suspend fun marquePage(
+        porteTitre: String,
+        dernier: Concept?,
+        suite: List<Concept>,
+        effacer: Boolean = false,
+    ): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val corps = buildJsonObject {
+                put("action", "marque_page")
+                if (effacer) {
+                    put("effacer", true)
+                } else {
+                    put("porteTitre", porteTitre)
+                    dernier?.let { d ->
+                        put("dernier", buildJsonObject {
+                            put("id", d.id)
+                            put("titre", d.titre)
+                            put("url", d.source.url)
+                        })
+                    }
+                    put("suite", buildJsonArray { suite.forEach { add(json.encodeToJsonElement(Concept.serializer(), it)) } })
+                }
+            }.toString()
+            val (code, _) = requete("POST", FONCTION_LOT, corps, jeton())
+            code in 200..299
+        }.getOrDefault(false)
+    }
+
+    /** Enregistre la note de 1 à 10 d'une porte ; 8 ou plus propose sa suite dans le lot de demain. */
+    suspend fun noterPorte(jour: String, porte: Porte, note: Int): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val jeton = jeton()
+            val uid = utilisateur() ?: return@runCatching false
+            val ligne = buildJsonObject {
+                put("user_id", uid)
+                put("jour", jour)
+                put("porte_id", porte.id)
+                put("porte_titre", porte.titre)
+                put("theme", porte.concepts.firstOrNull()?.theme)
+                put("type", porte.type)
+                put("note", note.coerceIn(1, 10))
+            }
+            val (code, _) = requete(
+                "POST",
+                "/rest/v1/chevet_notes_portes?on_conflict=user_id,jour,porte_id",
                 buildJsonArray { add(ligne) }.toString(),
                 jeton,
                 mapOf("Prefer" to "resolution=merge-duplicates,return=minimal"),

@@ -73,6 +73,7 @@ import fr.dash.chevet.data.ConceptVu
 import fr.dash.chevet.data.Curiosite
 import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
+import fr.dash.chevet.data.NotePorte
 import fr.dash.chevet.data.Progression
 import fr.dash.chevet.data.Voisin
 import fr.dash.chevet.model.Concept
@@ -175,9 +176,9 @@ internal fun EcranMenu(
             )
             PageMenu.CoupsDeCoeur -> PageCoupsDeCoeur(concepts, coeurs, actions, ouvrir, retour)
             PageMenu.Carnet -> PageCarnet(concepts, ouvrir, retour)
-            PageMenu.Soirees -> PageSoirees(concepts, ouvrir, retour)
+            PageMenu.Soirees -> PageSoirees(concepts, progression.notes(), ouvrir, retour)
             PageMenu.Recherche -> PageRecherche(concepts, ouvrir, retour)
-            PageMenu.Stats -> PageStats(concepts, coeurs, retour)
+            PageMenu.Stats -> PageStats(concepts, coeurs, progression.notes(), retour)
             PageMenu.Curiosites -> PageCuriosites(distant, journal, partage, actions, retour)
             PageMenu.Reviser -> PageReviser(progression, coeurs, journal, onFin = { version += 1 }, onRetour = retour)
         }
@@ -347,6 +348,14 @@ private fun EcranRelire(vu: ConceptVu, coeurs: Coeurs, actions: ActionsMenu, onR
         vu.porteTitre?.let {
             Text("Porte « $it »", color = EncreDouce, style = MaterialTheme.typography.bodySmall)
         }
+        if (c.estCran) {
+            Text(
+                if (c.sens == fr.dash.chevet.model.Sens.PLUS_LOIN) "Plus loin depuis « ${c.depuisTitre.orEmpty()} »"
+                else "À côté de « ${c.depuisTitre.orEmpty()} »",
+                color = EncreDouce.copy(alpha = 0.8f),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         Spacer(Modifier.height(12.dp))
         Text(c.question, color = Encre, style = MaterialTheme.typography.titleLarge, fontStyle = FontStyle.Italic)
         c.cartes.forEachIndexed { i, carte ->
@@ -356,6 +365,16 @@ private fun EcranRelire(vu: ConceptVu, coeurs: Coeurs, actions: ActionsMenu, onR
             Spacer(Modifier.height(8.dp))
             Etiquette("À retenir")
             CarteRelue(c.aRetenir, coeurs.aime(c.id, -1), gras = true) { actions.onCoeur(c, -1, c.aRetenir, vu.vuLe) }
+        }
+        c.contrePoint?.let { cp ->
+            Spacer(Modifier.height(8.dp))
+            Etiquette("L'autre camp répondrait")
+            CarteRelue(cp.texte, coeurs.aime(c.id, -3)) { actions.onCoeur(c, -3, cp.texte, vu.vuLe) }
+        }
+        c.pont?.let { pont ->
+            Spacer(Modifier.height(8.dp))
+            Etiquette("Pont avec « ${pont.avecTitre} »")
+            CarteRelue(pont.texte, coeurs.aime(c.id, -4)) { actions.onCoeur(c, -4, pont.texte, vu.vuLe) }
         }
         c.ordreDeGrandeur?.takeIf { it.isNotBlank() }?.let {
             Text(it, color = Ambre, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(vertical = 8.dp))
@@ -777,7 +796,7 @@ private fun PageCarnet(concepts: List<ConceptVu>, onRelire: (ConceptVu) -> Unit,
 // ---------------------------------------------------------------- Soirées passées
 
 @Composable
-private fun PageSoirees(concepts: List<ConceptVu>, onRelire: (ConceptVu) -> Unit, onRetour: () -> Unit) {
+private fun PageSoirees(concepts: List<ConceptVu>, notes: List<NotePorte>, onRelire: (ConceptVu) -> Unit, onRetour: () -> Unit) {
     PageMenuColonne("Soirées passées", onRetour) {
         if (concepts.isEmpty()) Vide("Rien encore : tes soirées s'empileront ici.")
         concepts.groupBy { it.vuLe }.toSortedMap(compareByDescending { it }).forEach { (jour, duSoir) ->
@@ -792,16 +811,23 @@ private fun PageSoirees(concepts: List<ConceptVu>, onRelire: (ConceptVu) -> Unit
             ) {
                 duSoir.groupBy { it.porteTitre }.forEach { (porte, liste) ->
                     if (porte != null) {
-                        Text("« $porte »", color = EncreDouce, fontStyle = FontStyle.Italic, modifier = Modifier.padding(top = 6.dp))
+                        val note = notes.lastOrNull { n -> n.jour == jour && liste.any { it.porte == n.porte } }?.note
+                        Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("« $porte »", color = EncreDouce, fontStyle = FontStyle.Italic, modifier = Modifier.weight(1f))
+                            if (note != null) Text("$note/10", color = Ambre, fontWeight = FontWeight.SemiBold)
+                        }
                     }
                     liste.sortedBy { it.rang }.forEach { vu ->
                         Row(
                             Modifier
                                 .fillMaxWidth()
                                 .clickable { onRelire(vu) }
-                                .padding(vertical = 8.dp),
+                                .padding(start = if (vu.concept.estCran) 18.dp else 0.dp, top = 8.dp, bottom = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
+                            if (vu.concept.estCran) {
+                                Text(if (vu.concept.sens == fr.dash.chevet.model.Sens.PLUS_LOIN) "↓ " else "→ ", color = Ambre, fontSize = 12.sp)
+                            }
                             Box(Modifier.size(8.dp).background(couleurTheme(vu.concept.theme), RoundedCornerShape(50)))
                             Spacer(Modifier.width(10.dp))
                             Text(vu.concept.titre, color = Encre, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
@@ -874,7 +900,7 @@ private fun PageRecherche(concepts: List<ConceptVu>, onRelire: (ConceptVu) -> Un
 // ---------------------------------------------------------------- Stats
 
 @Composable
-private fun PageStats(concepts: List<ConceptVu>, coeurs: Coeurs, onRetour: () -> Unit) {
+private fun PageStats(concepts: List<ConceptVu>, coeurs: Coeurs, notes: List<NotePorte>, onRetour: () -> Unit) {
     PageMenuColonne("Stats", onRetour) {
         val soirees = concepts.map { it.vuLe }.distinct().size
         val fruits = concepts.count { it.maitrise }
@@ -887,6 +913,9 @@ private fun PageStats(concepts: List<ConceptVu>, coeurs: Coeurs, onRetour: () ->
             "Fruits (concepts maîtrisés)" to "$fruits",
             "Révisions dues aujourd'hui" to "$dues",
             "Cœurs posés" to "${coeurs.tous.size} sur $aimes concept${if (aimes > 1) "s" else ""}",
+            "Crans explorés (plus loin, à côté)" to "${concepts.count { it.concept.estCran }}",
+            "Ponts croisés" to "${concepts.count { it.concept.pont != null }}",
+            "Note moyenne des portes" to if (notes.isEmpty()) "pas encore" else "%.1f/10 sur %d".format(notes.map { it.note }.average(), notes.size),
         )
         Column(
             Modifier
@@ -899,6 +928,28 @@ private fun PageStats(concepts: List<ConceptVu>, coeurs: Coeurs, onRetour: () ->
                 Row(Modifier.padding(vertical = 5.dp)) {
                     Text(cle, color = EncreDouce, modifier = Modifier.weight(1f))
                     Text(valeur, color = Ambre, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+
+        if (notes.isNotEmpty()) {
+            Spacer(Modifier.height(20.dp))
+            Etiquette("Note moyenne par thème")
+            notes.groupBy { it.theme ?: "Autre" }.toSortedMap().forEach { (theme, liste) ->
+                Row(Modifier.padding(vertical = 5.dp)) {
+                    Text(theme, color = Encre, modifier = Modifier.weight(1f))
+                    Text("%.1f/10 · %d".format(liste.map { it.note }.average(), liste.size), color = Ambre)
+                }
+            }
+            val parType = notes.filter { !it.type.isNullOrBlank() }.groupBy { it.type!! }
+            if (parType.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                Etiquette("Note moyenne par type de porte")
+                parType.toSortedMap().forEach { (type, liste) ->
+                    Row(Modifier.padding(vertical = 5.dp)) {
+                        Text(type.replaceFirstChar { it.uppercase() }, color = Encre, modifier = Modifier.weight(1f))
+                        Text("%.1f/10 · %d".format(liste.map { it.note }.average(), liste.size), color = Ambre)
+                    }
                 }
             }
         }
