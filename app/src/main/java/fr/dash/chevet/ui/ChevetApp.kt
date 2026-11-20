@@ -168,7 +168,8 @@ fun ChevetApp(
     var position by remember { mutableStateOf<Position?>(null) }
     var pontDuSoir by remember { mutableStateOf(soiree.pontDuSoir()) }
     var apresCoucher by remember { mutableStateOf(soiree.apresCoucher()) }
-    val fremir = remember { soiree.carrefoursVus < 3 }
+    // Les trois premiers carrefours, la carte frémit pour montrer qu'elle bouge.
+    var carrefoursVus by remember { mutableIntStateOf(soiree.carrefoursVus) }
     var marqueGardee by remember { mutableStateOf(false) }
     var porteDuRecap by remember { mutableStateOf<Porte?>(null) }
 
@@ -554,7 +555,7 @@ fun ChevetApp(
                         exploration = !lotExemple,
                         apresCoucher = apresCoucher,
                         pontAffiche = pontAffiche,
-                        fremir = fremir,
+                        fremir = carrefoursVus <= 3,
                         journal = journal,
                         coeurs = coeurs,
                         creusagesRestants = (creusagesParSoir - creusagesFaits).coerceAtLeast(0),
@@ -590,7 +591,10 @@ fun ChevetApp(
                                 journal.note("pont_vu", "concept" to id)
                             }
                         },
-                        onCarrefourVu = { soiree.carrefoursVus = soiree.carrefoursVus + 1 },
+                        onCarrefourVu = {
+                            carrefoursVus += 1
+                            soiree.carrefoursVus = carrefoursVus
+                        },
                         onLireAncienne = {
                             journal.note("regeneration_annulee", "type" to "suite")
                             tache?.cancel()
