@@ -2,7 +2,7 @@
 //
 // Étapes : 0 composer les 3 portes (profil + actu RSS + terrier Wikipédia + curiosités)
 //          1-3 rédiger les cartes de chaque porte à partir des articles Wikipédia
-//          4-6 relecture factuelle de chaque porte contre les articles
+//          4-6 vérification factuelle de chaque porte contre les articles (sans réécriture)
 //          7 pépite, assemblage, lot prêt
 //
 // Actions (POST JSON) :
@@ -25,7 +25,7 @@
 //                                         (sans répéter celles du lot) et renvoie leurs titres.
 //   {"action":"bonus","demande":"...","porte":"id"}
 //                                         écrit la porte bonus choisie, une étape par appel
-//                                         (rédaction, relecture, assemblage) ; elle rejoint le lot.
+//                                         (rédaction, vérification, assemblage) ; elle rejoint le lot.
 //   {"action":"voisins","url":"...","titre":"...","slug":"..."}
 //                                         articles Wikipédia liés à un concept, pas encore explorés,
 //                                         choisis par l'IA pour le graphe du terrier (gardés en cache).
@@ -260,13 +260,23 @@ async function resoudreArticle(fr: string, en?: string) {
   return null;
 }
 
+/**
+ * Vrai pour une ligne de bibliographie ou de navigation (ouvrage, article cité, portail) :
+ * le modèle prend sinon un titre d'ouvrage pour un fait (« la pénurie jusqu'en 2030 »).
+ */
+function estReference(p: string): boolean {
+  return /\b(ISBN|ISSN|DOI|doi:|OCLC|PMID|JSTOR)\b|lire en ligne|consulté le|retrieved|archived from|\bvol\.\s*\d|\bno\s+\d+\s*,|\bp\.\s*\d+|\bpp\.\s*\d+|^Portail\b|^Portal\b|\b\d{2,4}\s*p\.\s*\(/i
+    .test(p);
+}
+
 async function extrait(titre: string, langue: string, motsCles: string[], longueur = 3000): Promise<string> {
   const d = await wiki(
     { action: "query", prop: "extracts", explaintext: "1", titles: titre, redirects: "1" },
     langue,
   );
   const texte = ((d.query?.pages?.[0]?.extract as string) ?? "").replace(/\n={2,}[^=\n]+={2,}\n/g, "\n");
-  const paragraphes = texte.split(/\n+/).map((p) => p.trim().slice(0, 900)).filter((p) => p.length > 60);
+  const paragraphes = texte.split(/\n+/).map((p) => p.trim().slice(0, 900))
+    .filter((p) => p.length > 60 && !estReference(p));
   if (paragraphes.length === 0) return "";
   const intro = paragraphes[0].slice(0, 900);
   const cles = motsCles.map((m) => m.toLowerCase()).filter((m) => m.length > 4);
@@ -579,7 +589,7 @@ async function rediger(travail: Json, i: number, profil: Json) {
     if (!c.extrait) c.extrait = await extrait(c.wiki.titre, c.wiki.langue, [...cles, ...motsDe(c.titre)]);
   }
 
-  // Longueur réglée par le lecteur ; la relecture en a besoin pour borner les cartes gardées.
+  // Longueur réglée par le lecteur ; la vérification en a besoin pour borner les cartes gardées.
   const longueur = longueurCartes(profil);
   porte.cartesMin = longueur.min;
   porte.cartesMax = longueur.max;
@@ -601,7 +611,9 @@ Règles :
 - ${longueur.min} à ${longueur.max} cartes par concept selon sa complexité, ${longueur.mots} mots au plus par carte, une idée par carte.
 - Raconte : la première carte pose une scène datée, un lieu ou une personne réelle de l'article ; pas de définition de dictionnaire, pas de liste, pas de jargon.
 - Au moins une carte par concept contient une date ou un chiffre de l'article.
-- Relie le concept à la question de la porte : explique le pourquoi, pas seulement le quoi.
+- Ne relie le concept à la question de la porte que si l'article fait lui-même ce lien. Sinon, pose les faits de l'article sans conclure à sa place : le lecteur fera le lien.
+- N'écris jamais qu'un fait cause, aggrave, pousse, oblige, incite ou explique autre chose si l'article ne le dit pas en toutes lettres.
+- "question", "aRetenir", "aRaconter" et "qcm" suivent les mêmes règles : aucun d'eux ne présuppose un lien que l'article n'établit pas.
 - N'invente jamais de scène, de personnage, de dialogue ni d'exemple : tout vient de l'article. S'il ne raconte pas d'histoire, pars d'un fait daté.
 - Si l'article ne parle pas vraiment du concept ou de la porte, renvoie pour ce concept seulement {"titre":"...","horsSujet":true}.
 - "question" : la question qui ouvre le concept et donne envie de glisser.
@@ -630,7 +642,7 @@ Format JSON :
   porte.redaction = resultat.concepts ?? [];
 }
 
-// ------------------------------------------------------------------ Étapes 4-6 : relecture factuelle
+// ------------------------------------------------------------------ Étapes 4-6 : vérification factuelle
 
 function normaliser(texte: string): string {
   return texte
@@ -651,6 +663,16 @@ function estProuve(preuve: string | undefined, source: string): boolean {
   return mots.filter((m) => s.includes(m)).length / mots.length >= 0.85;
 }
 
+/** Vrai si une phrase corrigée parle de l'article au lieu du sujet (« l'article ne dit pas… »). */
+function estMeta(texte: string): boolean {
+  return /\b(l['’]article|la source|le texte source|l['’]extrait)\b/i.test(texte);
+}
+
+/**
+ * Vérification factuelle sans réécriture : le modèle juge chaque carte telle quelle (verdict + citation),
+ * le code garde le texte d'origine des cartes jugées justes dont la citation est retrouvée dans l'article,
+ * et retire les autres. Seules la phrase à retenir et la version à raconter peuvent être corrigées.
+ */
 async function relire(travail: Json, i: number) {
   const porte = travail.portes?.[i];
   if (!porte?.redaction?.length) return;
@@ -659,60 +681,70 @@ async function relire(travail: Json, i: number) {
     .filter(({ r }: Json) => r && !r.horsSujet);
   if (valides.length === 0) return;
 
-  const consigne = `Tu es relecteur factuel. Pour chaque concept, compare le texte à son article source.
-Pour chaque carte, recopie mot pour mot dans "preuve" la phrase de l'article qui la prouve.
-Si aucune phrase ne la prouve, réécris la carte pour qu'elle dise exactement ce que dit une phrase de l'article, ou supprime-la.
-Sois intraitable sur :
-- le sens exact (une négation inversée, « avec » au lieu de « sans », est une erreur grave) ;
-- les liens de cause à effet que l'article n'établit pas ;
-- les scènes, personnages ou exemples inventés ;
-- le rôle exact des institutions et des personnes.
-"ordreDeGrandeur" : garde-le seulement s'il vient de l'article et concerne la porte « ${porte.titre} », avec sa preuve ; sinon null.
-"aRetenir" et "aRaconter" : retire toute affirmation que les cartes prouvées ne soutiennent pas.
-Ne change pas le style.
+  const consigne = `Tu es vérificateur factuel. Tu ne réécris RIEN : tu juges chaque carte telle quelle contre son article source.
+Pour chaque carte :
+- "preuve" : recopie mot pour mot la phrase de l'article qui la prouve, ou null ;
+- "verdict" : "ok" si tout ce qu'affirme la carte est dans l'article, sinon "faux".
+Une carte est "faux" si elle contient : un sens inversé (« avec » au lieu de « sans », négation perdue), un lien de cause à effet que l'article n'établit pas, une scène, un personnage, un détail ou un chiffre absent de l'article, un rôle inexact d'une institution ou d'une personne.
+Les reformulations, images et transitions de style sont permises tant qu'elles n'ajoutent aucun fait.
+"aRetenir" et "aRaconter" : verdict "ok" ou "faux" ; si "faux", donne une version corrigée de même longueur, dans le même ton, qui ne dit que ce que l'article prouve et parle du sujet, jamais de l'article.
+"ordreDeGrandeur" : sa preuve exacte si le chiffre vient de l'article et concerne la porte « ${porte.titre} », sinon null.
 
 ${valides.map(({ r, k }: Json) => `### Concept ${k + 1} : ${r.titre}
 Article source :
 ${porte.concepts[k]?.extrait ?? ""}
-Texte à relire :
-${JSON.stringify(r)}`).join("\n\n")}
+Cartes à juger :
+${(r.cartes ?? []).map((c: string, n: number) => `${n + 1}. ${c}`).join("\n")}
+aRetenir : ${r.aRetenir ?? ""}
+aRaconter : ${r.aRaconter ?? ""}
+ordreDeGrandeur : ${r.ordreDeGrandeur ?? "null"}`).join("\n\n")}
 
-Réponds dans le même ordre, un objet par concept relu :
-{"concepts":[{"titre":"...","question":"...","cartes":[{"texte":"...","preuve":"citation exacte"}],"aRetenir":"...","aRaconter":"...",
-"ordreDeGrandeur":{"texte":"...","preuve":"citation exacte"} ou null,
-"qcm":{"question":"...","choix":["bonne","fausse","fausse"],"autreAngle":"..."},"creuser":["...","...","..."]}],
-"corrections":["..."]}`;
+Réponds dans le même ordre, un objet par concept, une entrée par carte dans l'ordre :
+{"concepts":[{"cartes":[{"verdict":"ok","preuve":"citation exacte"},{"verdict":"faux","preuve":null,"raison":"..."}],
+"aRetenir":{"verdict":"ok"},"aRaconter":{"verdict":"faux","corrige":"..."},"ordreDeGrandeur":{"preuve":"citation exacte"} ou null}]}`;
 
-  const resultat = await groq(MODELE_VERIFICATION, SYSTEME_CHEVET, consigne, 3400, 0.2);
-  const relus: Json[] = Array.isArray(resultat.concepts) ? resultat.concepts : [];
-  if (relus.length !== valides.length) {
-    porte.corrections = ["Relecture inutilisable : texte d'origine conservé."];
+  const resultat = await groq(MODELE_VERIFICATION, SYSTEME_CHEVET, consigne, 4000, 0.1);
+  const verifs: Json[] = Array.isArray(resultat.concepts) ? resultat.concepts : [];
+  if (verifs.length !== valides.length) {
+    porte.corrections = ["Vérification inutilisable : texte d'origine conservé."];
     return;
   }
 
   // Fourchette réglée par le lecteur (2 à 4 par défaut) : en dessous du minimum, le concept tombe.
   const minimum = Math.max(1, Math.min(2, Number(porte.cartesMin) || 2));
   const maximum = Math.max(minimum, Number(porte.cartesMax) || 5);
-  let retirees = 0;
+  const retraits: string[] = [];
   valides.forEach(({ r: original, k }: Json, n: number) => {
-    const relu = relus[n];
+    const v = verifs[n] ?? {};
     const source: string = porte.concepts[k]?.extrait ?? "";
-    const cartes = (relu.cartes ?? []).filter((c: Json) => {
-      const ok = typeof c === "object" && c.texte && estProuve(c.preuve, source);
-      if (!ok) retirees++;
+    const cartes = ((original.cartes ?? []) as Json[]).filter((texte: Json, c: number) => {
+      const j = v.cartes?.[c];
+      const ok = typeof texte === "string" && j?.verdict === "ok" && estProuve(j?.preuve, source);
+      if (!ok) {
+        retraits.push(`${original.titre}, carte ${c + 1} : ${j?.raison ?? (j?.verdict === "ok" ? "citation introuvable" : "jugée fausse")}`);
+      }
       return ok;
-    }).map((c: Json) => c.texte).slice(0, maximum);
-    const odg = relu.ordreDeGrandeur;
-    // La relecture ne touche qu'aux cartes, aux synthèses et au chiffre ; le reste vient de la rédaction.
+    }).slice(0, maximum);
+    // Synthèse jugée fausse : la correction si elle parle du sujet, sinon une carte prouvée.
+    const synthese = (champ: string, repli: string | undefined) => {
+      const j = v[champ];
+      if (!j || j.verdict !== "faux") return original[champ] || repli;
+      retraits.push(`${original.titre}, ${champ} corrigé`);
+      return typeof j.corrige === "string" && j.corrige && !estMeta(j.corrige) ? j.corrige : repli;
+    };
+    const odg = v.ordreDeGrandeur;
+    // La vérification ne touche qu'aux cartes, aux synthèses et au chiffre ; le reste vient de la rédaction.
     porte.redaction[k] = cartes.length < minimum ? { titre: original.titre, horsSujet: true } : {
       ...original,
       cartes,
-      aRetenir: relu.aRetenir || cartes.at(-1),
-      aRaconter: relu.aRaconter || relu.aRetenir || cartes[0],
-      ordreDeGrandeur: odg && typeof odg === "object" && estProuve(odg.preuve, source) ? odg.texte : null,
+      aRetenir: synthese("aRetenir", cartes.at(-1)),
+      aRaconter: synthese("aRaconter", cartes[0]),
+      ordreDeGrandeur: original.ordreDeGrandeur && odg && typeof odg === "object" && estProuve(odg.preuve, source)
+        ? original.ordreDeGrandeur
+        : null,
     };
   });
-  porte.corrections = [...(resultat.corrections ?? []), `${retirees} carte(s) sans preuve retirée(s)`];
+  porte.corrections = retraits.length ? retraits : ["Toutes les cartes sont prouvées."];
 }
 
 // ------------------------------------------------------------------ Étape 7 : pépite et assemblage
@@ -1079,7 +1111,7 @@ async function suite(userId: string, porteId: string, nbGardes: number, demande:
       await relire({ portes: [s.pt] }, 0);
     } else {
       const nouveaux = conceptsRediges(s.pt);
-      if (nouveaux.length === 0) throw new Error("Suite vide après relecture");
+      if (nouveaux.length === 0) throw new Error("Suite vide après vérification");
       const contenu = lot.contenu;
       const cible = contenu.portes.find((p: Json) => p.id === porteId);
       cible.concepts = [...cible.concepts.slice(0, n), ...nouveaux];
@@ -1173,7 +1205,7 @@ async function bonus(userId: string, demande: string, porteId: string | null) {
         await relire({ portes: [pt] }, 0);
       } else {
         const concepts = conceptsRediges(pt);
-        if (concepts.length === 0) throw new Error("Porte vide après relecture");
+        if (concepts.length === 0) throw new Error("Porte vide après vérification");
         const contenu = lot.contenu;
         let id = pt.id;
         while ((contenu.portes ?? []).some((p: Json) => p.id === id)) id += "-b";
