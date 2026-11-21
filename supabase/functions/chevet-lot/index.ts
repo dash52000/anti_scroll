@@ -611,10 +611,6 @@ function conceptValide(c: Json): boolean {
     c.qcm && Array.isArray(c.qcm.choix);
 }
 
-/**
- * Compose 3 portes. Sans [bonus], c'est le lot du matin ; avec, ce sont des portes en plus
- * pour ce soir (« d'autres portes »), qui ne touchent pas aux concepts à prolonger demain.
- */
 // ------------------------------------------------------------------ Score d'intérêt (notes de porte)
 
 type Cote = { nom: string; moyenne: number; n: number };
@@ -699,6 +695,10 @@ function scorePorte(porte: Json, appris: Appris): number {
   return (part(appris.themes, theme) + part(appris.types, porte.type)) / 2;
 }
 
+/**
+ * Compose 3 portes. Sans [bonus], c'est le lot du matin ; avec, ce sont des portes en plus
+ * pour ce soir (« d'autres portes »), qui ne touchent pas aux concepts à prolonger demain.
+ */
 async function composer(lot: Json, profil: Json, bonus?: Exclusions) {
   const userId = lot.user_id;
   const appris = await interetAppris(userId);
