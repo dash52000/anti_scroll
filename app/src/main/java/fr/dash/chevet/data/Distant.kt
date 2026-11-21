@@ -81,6 +81,22 @@ data class Voisin(
     val url: String = "",
 )
 
+/** Une note perso. [suite] : aucune, porte (déposée dans la boîte à curiosités) ou reponse (« réponds-moi »). */
+@Serializable
+data class NotePerso(
+    val id: String = "",
+    val texte: String = "",
+    val suite: String = "aucune",
+    val reponse: String? = null,
+    @kotlinx.serialization.SerialName("cree_le") val creeLe: String = "",
+)
+
+/** Résultat de « réponds-moi » : la réponse, ou le quota du jour atteint, ou un message d'erreur. */
+data class ReponseNote(val texte: String? = null, val quota: Boolean = false, val erreur: String? = null)
+
+/** La note qui revient dans le récap : une vieille note et les concepts lus depuis qui s'y rattachent. */
+data class NoteRevenue(val id: String, val texte: String, val jour: String, val concepts: List<String>)
+
 /** Une entrée de la boîte à curiosités. */
 @Serializable
 data class Curiosite(
@@ -674,6 +690,152 @@ class Distant(context: Context) {
             json.decodeFromString(kotlinx.serialization.builtins.ListSerializer(Curiosite.serializer()), texte)
         }.getOrNull()
     }
+
+    // ------------------------------------------------------------ Notes perso
+
+    /** Les notes perso, les plus récentes d'abord ; null hors connexion. */
+    suspend fun notesPerso(): List<NotePerso>? = withContext(Dispatchers.IO) {
+        runCatching {
+            val (code, texte) = requete(
+                "GET",
+                "/rest/v1/chevet_notes?select=id,texte,suite,reponse,cree_le&order=cree_le.desc&limit=100",
+                jeton = jeton(),
+            )
+            if (code !in 200..299) return@runCatching null
+            json.decodeFromString(kotlinx.serialization.builtins.ListSerializer(NotePerso.serializer()), texte)
+        }.getOrNull()
+    }
+
+    suspend fun ajouterNote(texte: String): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val (code, _) = requete(
+                "POST",
+                "/rest/v1/chevet_notes",
+                buildJsonObject { put("texte", texte) }.toString(),
+                jeton(),
+                mapOf("Prefer" to "return=minimal"),
+            )
+            code in 200..299
+        }.getOrDefault(false)
+    }
+
+    /** « En faire une porte » : la note rejoint la boîte à curiosités, qui nourrit la composition des portes. */
+    suspend fun noteEnPorte(note: NotePerso): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            val jeton = jeton()
+            val (code, _) = requete(
+                "POST",
+                "/rest/v1/chevet_curiosites",
+                buildJsonObject {
+                    put("texte", note.texte)
+                    put("origine", "note")
+                }.toString(),
+                jeton,
+                mapOf("Prefer" to "return=minimal"),
+            )
+            if (code !in 200..299) return@runCatching false
+            val (suite, _) = requete(
+                "PATCH",
+                "/rest/v1/chevet_notes?id=eq.${note.id}",
+                buildJsonObject { put("suite", "porte") }.toString(),
+                jeton,
+                mapOf("Prefer" to "return=minimal"),
+            )
+            suite in 200..299
+        }.getOrDefault(false)
+    }
+
+    /** « Réponds-moi » : la réponse arrive tout de suite et reste sous la note (3 par jour). */
+    suspend fun repondreNote(note: NotePerso): ReponseNote = withContext(Dispatchers.IO) {
+        runCatching {
+            val (_, texte) = requete(
+                "POST",
+                "/functions/v1/chevet-notes",
+                buildJsonObject {
+                    put("action", "repondre")
+                    put("note_id", note.id)
+                }.toString(),
+                jeton(),
+            )
+            val o = objet(texte)
+            when {
+                o == null -> ReponseNote(erreur = "Pas de réponse pour l'instant.")
+                o["quota"] != null -> ReponseNote(quota = true)
+                o["reponse"] != null -> ReponseNote(texte = o["reponse"]?.jsonPrimitive?.contentOrNull)
+                else -> ReponseNote(erreur = o["erreur"]?.jsonPrimitive?.contentOrNull ?: "Pas de réponse pour l'instant.")
+            }
+        }.getOrElse { ReponseNote(erreur = "Pas de connexion : réessaie plus tard.") }
+    }
+
+    /** La vieille note à ressortir au récap (une par semaine au plus), ou null. */
+    suspend fun noteQuiRevient(): NoteRevenue? = withContext(Dispatchers.IO) {
+        runCatching {
+            val (code, texte) = requete(
+                "POST",
+                "/functions/v1/chevet-notes",
+                """{"action":"revient"}""",
+                jeton(),
+            )
+            val o = objet(texte)
+            val n = o?.get("note") as? JsonObject
+            if (code !in 200..299 || n == null) return@runCatching null
+            val concepts = (o["concepts"] as? JsonArray)?.mapNotNull { it.jsonPrimitive.contentOrNull }.orEmpty()
+            val note = n["texte"]?.jsonPrimitive?.contentOrNull ?: return@runCatching null
+            if (concepts.isEmpty()) return@runCatching null
+            NoteRevenue(
+                id = n["id"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                texte = note,
+                jour = n["jour"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                concepts = concepts,
+            )
+        }.getOrNull()
+    }
+
+    // ------------------------------------------------------------ Onboarding et check-in
+
+    /** Centres d'intérêt tirés d'un historique YouTube par l'IA ; liste vide si le serveur ne répond pas. */
+    suspend fun interetsYoutube(resume: ResumeYoutube): List<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val corps = buildJsonObject {
+                put("action", "youtube")
+                put("chaines", buildJsonArray {
+                    resume.chaines.forEach { (nom, n) ->
+                        add(buildJsonObject {
+                            put("nom", nom)
+                            put("n", n)
+                        })
+                    }
+                })
+                put("titres", buildJsonArray { resume.titres.forEach { add(JsonPrimitive(it)) } })
+            }.toString()
+            val (code, texte) = requete("POST", "/functions/v1/chevet-onboarding", corps, jeton())
+            if (code !in 200..299) return@runCatching emptyList()
+            (objet(texte)?.get("puces") as? JsonArray)?.mapNotNull { it.jsonPrimitive.contentOrNull }.orEmpty()
+        }.getOrDefault(emptyList())
+    }
+
+    /** Enregistre le check-in de la semaine (un seul par semaine : le dernier gagne). */
+    suspend fun enregistrerCheckin(semaine: String, ressenti: String, raisons: List<String>): Boolean =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val jeton = jeton()
+                val uid = utilisateur() ?: return@runCatching false
+                val ligne = buildJsonObject {
+                    put("user_id", uid)
+                    put("semaine", semaine)
+                    put("ressenti", ressenti)
+                    put("raisons", buildJsonArray { raisons.forEach { add(JsonPrimitive(it)) } })
+                }
+                val (code, _) = requete(
+                    "POST",
+                    "/rest/v1/chevet_checkins?on_conflict=user_id,semaine",
+                    buildJsonArray { add(ligne) }.toString(),
+                    jeton,
+                    mapOf("Prefer" to "resolution=merge-duplicates,return=minimal"),
+                )
+                code in 200..299
+            }.getOrDefault(false)
+        }
 
     // ------------------------------------------------------------ Profil (réglages)
 

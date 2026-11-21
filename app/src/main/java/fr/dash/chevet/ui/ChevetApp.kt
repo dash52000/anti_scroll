@@ -58,6 +58,7 @@ import fr.dash.chevet.data.ConceptVu
 import fr.dash.chevet.data.Crans
 import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
+import fr.dash.chevet.data.NoteRevenue
 import fr.dash.chevet.data.PorteProposee
 import fr.dash.chevet.data.Preparation
 import fr.dash.chevet.data.Profil
@@ -148,7 +149,19 @@ fun ChevetApp(
     var conceptsDuSoir by remember { mutableStateOf<List<Concept>>(emptyList()) }
     var nouvellesFeuilles by remember { mutableStateOf<Set<String>>(emptySet()) }
     var reglages by remember { mutableStateOf<Boolean?>(null) }
-    var menu by remember { mutableStateOf(if (partageEntrant != null) PageMenu.Curiosites else null) }
+    var menu by remember {
+        mutableStateOf(
+            when {
+                partageEntrant != null -> PageMenu.Curiosites
+                // Le tout premier lancement s'ouvre sur l'onboarding, une seule fois ; il reste ensuite dans le menu.
+                !soiree.onboardingProposee && !soiree.onboardingFait -> {
+                    soiree.onboardingProposee = true
+                    PageMenu.Onboarding
+                }
+                else -> null
+            },
+        )
+    }
     var regen by remember { mutableStateOf<Regen?>(null) }
     var tache by remember { mutableStateOf<Job?>(null) }
     var bonus by remember { mutableStateOf<Bonus>(Bonus.Aucun) }
@@ -172,6 +185,16 @@ fun ChevetApp(
     var carrefoursVus by remember { mutableIntStateOf(soiree.carrefoursVus) }
     var marqueGardee by remember { mutableStateOf(false) }
     var porteDuRecap by remember { mutableStateOf<Porte?>(null) }
+    // La note qui revient : une vieille note perso et les concepts lus depuis qui s'y rattachent (une par semaine au plus).
+    var noteRevenue by remember { mutableStateOf<NoteRevenue?>(null) }
+    var noteRevenueEssayee by remember { mutableStateOf(false) }
+    LaunchedEffect(etape) {
+        if (etape == Etape.Recap && !lotExemple && !noteRevenueEssayee) {
+            noteRevenueEssayee = true
+            noteRevenue = distant.noteQuiRevient()
+            if (noteRevenue != null) journal.note("note_revient")
+        }
+    }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -612,6 +635,8 @@ fun ChevetApp(
                     terrier = progression.tous(),
                     aime = coeurs::conceptAime,
                     nouvelles = nouvellesFeuilles,
+                    noteRevenue = noteRevenue,
+                    checkin = { CarteCheckin(distant, soiree, journal) },
                     autrePorte = autrePorteLibelle(peutAutrePorte, comptees(ouvertes)),
                     onNote = noter,
                     onAutrePorte = allerAutrePorte,
@@ -665,6 +690,7 @@ fun ChevetApp(
 
         menu?.let { page ->
             EcranMenu(
+                soireePrefs = soiree,
                 page = page,
                 nuit = nuit,
                 soiree = EtatSoiree(
@@ -774,7 +800,7 @@ private fun Colonne(content: @Composable ColumnScope.() -> Unit) {
 }
 
 @Composable
-private fun Panneau(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+internal fun Panneau(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
     Column(
         modifier
             .fillMaxWidth()
@@ -1144,6 +1170,8 @@ private fun EcranRecap(
     terrier: List<ConceptVu>,
     aime: (String) -> Boolean,
     nouvelles: Set<String>,
+    noteRevenue: NoteRevenue?,
+    checkin: @Composable () -> Unit,
     autrePorte: String?,
     onNote: (Porte, Int) -> Unit,
     onAutrePorte: () -> Unit,
@@ -1165,6 +1193,23 @@ private fun EcranRecap(
             Spacer(Modifier.height(20.dp))
             NoteDePorte(porte, note) { onNote(porte, it) }
         }
+        noteRevenue?.let { r ->
+            Spacer(Modifier.height(24.dp))
+            Etiquette("Une vieille note")
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Le ${jourLisible(r.jour)} tu notais : « ${r.texte} »",
+                color = Encre,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Depuis, tu as croisé ${r.concepts.joinToString(", ") { "« $it »" }}.",
+                color = Ambre,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+        checkin()
         FinDeSoiree(teaser, terrier, aime, nouvelles, autrePorte, onAutrePorte, onBonneNuit)
     }
 }

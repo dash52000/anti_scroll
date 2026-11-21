@@ -30,6 +30,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Create
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Face
@@ -71,6 +72,8 @@ import androidx.compose.ui.unit.sp
 import fr.dash.chevet.data.Coeurs
 import fr.dash.chevet.data.ConceptVu
 import fr.dash.chevet.data.Curiosite
+import fr.dash.chevet.data.NotePerso
+import fr.dash.chevet.data.Soiree
 import fr.dash.chevet.data.Distant
 import fr.dash.chevet.data.Journal
 import fr.dash.chevet.data.NotePorte
@@ -84,7 +87,7 @@ import java.time.format.DateTimeFormatter
 import java.util.Locale
 
 /** Les pages du menu. */
-internal enum class PageMenu { Accueil, Terrier, CoupsDeCoeur, Carnet, Soirees, Recherche, Stats, Curiosites, Reviser }
+internal enum class PageMenu { Accueil, Terrier, CoupsDeCoeur, Carnet, Soirees, Recherche, Stats, Curiosites, Notes, Onboarding, Reviser }
 
 /** Ce que le menu montre de la soirée en cours. */
 internal data class EtatSoiree(
@@ -125,6 +128,7 @@ internal fun EcranMenu(
     page: PageMenu,
     nuit: Float,
     soiree: EtatSoiree,
+    soireePrefs: Soiree,
     progression: Progression,
     coeurs: Coeurs,
     distant: Distant,
@@ -180,6 +184,8 @@ internal fun EcranMenu(
             PageMenu.Recherche -> PageRecherche(concepts, ouvrir, retour)
             PageMenu.Stats -> PageStats(concepts, coeurs, progression.notes(), retour)
             PageMenu.Curiosites -> PageCuriosites(distant, journal, partage, actions, retour)
+            PageMenu.Notes -> PageNotes(distant, journal, actions, retour)
+            PageMenu.Onboarding -> PageOnboarding(distant, soireePrefs, journal, actions, retour)
             PageMenu.Reviser -> PageReviser(progression, coeurs, journal, onFin = { version += 1 }, onRetour = retour)
         }
 
@@ -192,7 +198,7 @@ internal fun EcranMenu(
 // ---------------------------------------------------------------- Briques du menu
 
 @Composable
-private fun PageMenuColonne(titre: String, onRetour: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+internal fun PageMenuColonne(titre: String, onRetour: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
     Column(
         Modifier
             .fillMaxSize()
@@ -325,6 +331,9 @@ private fun AccueilMenu(
             LigneMenu(Icons.Filled.Add, "Boîte à curiosités", "Une question, un lien : ça nourrit tes prochaines portes") {
                 actions.onPage(PageMenu.Curiosites)
             }
+            LigneMenu(Icons.Filled.Create, "Notes perso", "Tes idées et réflexions : en faire une porte, ou « réponds-moi »") {
+                actions.onPage(PageMenu.Notes)
+            }
             LigneMenu(Icons.Filled.PlayArrow, "Autre porte", soiree.autrePorte, actif = soiree.autrePortePossible, onClick = actions.onAutrePorte)
             LigneMenu(
                 Icons.Filled.Refresh,
@@ -332,6 +341,9 @@ private fun AccueilMenu(
                 if (aReviser > 0) "$aReviser révision${if (aReviser > 1) "s" else ""} due${if (aReviser > 1) "s" else ""}, et autant de QCM libres que tu veux" else "QCM libres, tes concepts aimés d'abord",
             ) { actions.onPage(PageMenu.Reviser) }
             LigneMenu(Icons.Filled.Face, "Ce que Chevet sait de moi", "Ta fiche, à corriger quand tu veux") { actions.onReglages(true) }
+            LigneMenu(Icons.Filled.Settings, "Faire connaissance", "Sujets à swiper, historique YouTube, niveaux : 5 minutes") {
+                actions.onPage(PageMenu.Onboarding)
+            }
         }
         Spacer(Modifier.height(32.dp))
     }
@@ -1060,6 +1072,130 @@ private fun PageCuriosites(
                         color = if (c.statut == "porte_generee") Ambre else EncreDouce,
                         fontSize = 11.sp,
                     )
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Notes perso
+
+@Composable
+private fun PageNotes(distant: Distant, journal: Journal, actions: ActionsMenu, onRetour: () -> Unit) {
+    var texte by remember { mutableStateOf("") }
+    var envoi by remember { mutableStateOf(false) }
+    var liste by remember { mutableStateOf<List<NotePerso>?>(null) }
+    var charge by remember { mutableStateOf(false) }
+    var occupee by remember { mutableStateOf<String?>(null) }
+    val portee = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        liste = distant.notesPerso()
+        charge = true
+    }
+
+    PageMenuColonne("Notes perso", onRetour) {
+        Text(
+            "Une idée, une réflexion à toi, écrite comme elle vient. Chaque note peut devenir une porte " +
+                "ou recevoir une réponse tout de suite. De temps en temps, le récap en ressort une ancienne.",
+            color = EncreDouce,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value = texte,
+            onValueChange = { texte = it },
+            placeholder = { Text("Ce qui te trotte dans la tête…") },
+            minLines = 3,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(8.dp))
+        Button(
+            onClick = {
+                val propre = texte.trim()
+                if (propre.isEmpty() || envoi) return@Button
+                envoi = true
+                portee.launch {
+                    val ok = distant.ajouterNote(propre)
+                    envoi = false
+                    journal.note("note_perso", "ok" to ok)
+                    if (ok) {
+                        texte = ""
+                        actions.onAnnonce("Note gardée.")
+                        liste = distant.notesPerso()
+                    } else {
+                        actions.onAnnonce("Pas de connexion : garde-la ici et réessaie plus tard.")
+                    }
+                }
+            },
+            enabled = texte.isNotBlank() && !envoi,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text(if (envoi) "Envoi…" else "Garder la note") }
+
+        Spacer(Modifier.height(20.dp))
+        Etiquette("Tes notes")
+        val l = liste
+        when {
+            !charge -> Text("Chargement…", color = EncreDouce)
+            l == null -> Text("Pas de connexion : les notes se consultent en ligne.", color = EncreDouce)
+            l.isEmpty() -> Text("Aucune note pour l'instant.", color = EncreDouce)
+            else -> l.forEach { n ->
+                Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                    Text(n.texte, color = Encre, style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        jourLisible(n.creeLe.take(10)) + if (n.suite == "porte") " · devenue une porte" else "",
+                        color = if (n.suite == "porte") Ambre else EncreDouce,
+                        fontSize = 11.sp,
+                    )
+                    n.reponse?.let { r ->
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            r,
+                            color = Encre,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Voile, RoundedCornerShape(10.dp))
+                                .padding(12.dp),
+                        )
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (n.suite != "porte") {
+                            TextButton(
+                                enabled = occupee == null,
+                                onClick = {
+                                    occupee = n.id
+                                    portee.launch {
+                                        val ok = distant.noteEnPorte(n)
+                                        journal.note("note_en_porte", "ok" to ok)
+                                        actions.onAnnonce(
+                                            if (ok) "Elle nourrira tes prochaines portes." else "Pas de connexion : réessaie plus tard.",
+                                        )
+                                        if (ok) liste = distant.notesPerso()
+                                        occupee = null
+                                    }
+                                },
+                            ) { Text("En faire une porte", color = Ambre) }
+                        }
+                        if (n.reponse == null) {
+                            TextButton(
+                                enabled = occupee == null,
+                                onClick = {
+                                    occupee = n.id
+                                    portee.launch {
+                                        val r = distant.repondreNote(n)
+                                        journal.note("note_reponds_moi", "ok" to (r.texte != null), "quota" to r.quota)
+                                        when {
+                                            r.texte != null -> liste = distant.notesPerso()
+                                            r.quota -> actions.onAnnonce("3 réponses par jour : la suivante attendra demain.")
+                                            else -> actions.onAnnonce(r.erreur ?: "Pas de réponse pour l'instant.")
+                                        }
+                                        occupee = null
+                                    }
+                                },
+                            ) { Text(if (occupee == n.id) "Il réfléchit…" else "Réponds-moi", color = Ambre) }
+                        }
+                    }
                 }
             }
         }

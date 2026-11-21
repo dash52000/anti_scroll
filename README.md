@@ -36,7 +36,12 @@ donc une nouvelle version s'installe par-dessus l'ancienne sans désinstaller.
 | Voisins d'un concept et « prolonger demain » (action `voisins`, colonnes `prolonger`) | Fait |
 | Longueur des cartes réglable, ajustée après 3 « trop dense » en 7 jours | Fait |
 | Boîte à curiosités : saisie et menu de partage Android | Fait |
-| Onboarding, check-in du dimanche | À faire |
+| Note de la porte (1 à 10) au récap | Fait |
+| Score d'intérêt : les notes de porte pondèrent la composition du lot et l'ordre des portes (`chevet-lot`) | Fait |
+| Notes perso (menu) : « en faire une porte », « réponds-moi » (fonction `chevet-notes`, 3 par jour) | Fait |
+| La note qui revient : une vieille note ressort au récap, une fois par semaine au plus | Fait |
+| Onboarding (swipe de sujets, import de l'historique YouTube, fiche, niveaux, coucher) | Fait |
+| Check-in du dimanche au récap (top / bof / lassant, et pourquoi), pris en compte par la composition | Fait |
 
 Reporté en V2 : banque d'images de paysages, météo, version courte automatique, photo
 dans la boîte à curiosités.
@@ -44,7 +49,7 @@ dans la boîte à curiosités.
 ## Côté serveur
 
 Chevet est hébergé dans le projet Supabase **Panier** : tables préfixées `chevet_`,
-fonctions `chevet-lot` (lot du jour, réglages, autres portes, voisins) et `chevet-creuser`. La clé Groq est un secret de fonction
+fonctions `chevet-lot` (lot du jour, réglages, autres portes, voisins, exploration), `chevet-creuser`, `chevet-notes` (réponds-moi, note qui revient) et `chevet-onboarding` (centres d'intérêt tirés de l'historique YouTube). La clé Groq est un secret de fonction
 (`CHEVET_GROQ_API_KEY`), jamais dans l'APK. Le profil du lecteur vit dans la table
 `chevet_profil`, pas dans ce dépôt.
 
