@@ -615,8 +615,94 @@ function conceptValide(c: Json): boolean {
  * Compose 3 portes. Sans [bonus], c'est le lot du matin ; avec, ce sont des portes en plus
  * pour ce soir (« d'autres portes »), qui ne touchent pas aux concepts à prolonger demain.
  */
+// ------------------------------------------------------------------ Score d'intérêt (notes de porte)
+
+type Cote = { nom: string; moyenne: number; n: number };
+type Appris = { themes: Cote[]; types: Cote[]; total: number; mauvaises: string[] };
+
+const NOTE_NEUTRE = 6;
+const POIDS_A_PRIORI = 2;
+
+/**
+ * Cote de chaque thème et de chaque type de porte, apprise des notes de 1 à 10 des 90 derniers jours.
+ * La moyenne est tirée vers une note neutre tant que les notes sont rares (2 notes « virtuelles » à 6),
+ * pour qu'une seule note ne décide de rien.
+ */
+async function interetAppris(userId: string | null): Promise<Appris | null> {
+  if (!userId) return null;
+  const { data } = await admin.from("chevet_notes_portes").select("porte_titre, theme, type, note, jour")
+    .eq("user_id", userId).gte("jour", decaler(jourParis(), -90)).order("jour", { ascending: false }).limit(300);
+  const notes: Json[] = data ?? [];
+  if (notes.length === 0) return null;
+  const cotes = (cle: "theme" | "type"): Cote[] => {
+    const groupes = new Map<string, number[]>();
+    for (const n of notes) {
+      const nom = String(n[cle] ?? "").trim();
+      if (nom) groupes.set(nom, [...(groupes.get(nom) ?? []), Number(n.note)]);
+    }
+    return [...groupes].map(([nom, v]) => ({
+      nom,
+      n: v.length,
+      moyenne: (v.reduce((a, b) => a + b, 0) + NOTE_NEUTRE * POIDS_A_PRIORI) / (v.length + POIDS_A_PRIORI),
+    })).sort((a, b) => b.moyenne - a.moyenne);
+  };
+  return {
+    themes: cotes("theme"),
+    types: cotes("type"),
+    total: notes.length,
+    mauvaises: notes.filter((n) => Number(n.note) <= 4).slice(0, 4).map((n) => String(n.porte_titre)),
+  };
+}
+
+const arrondi1 = (x: number) => (Math.round(x * 10) / 10).toString().replace(".", ",");
+
+/** Ce que les notes ont appris, en consigne pour la composition. Vide tant que les notes sont trop rares. */
+function consigneInteret(appris: Appris | null): string {
+  if (!appris || appris.total < 3) return "";
+  const ligne = (c: Cote[]) => c.map((x) => `${x.nom} ${arrondi1(x.moyenne)}/10 (${x.n} note${x.n > 1 ? "s" : ""})`).join(" ; ");
+  return `Ce que les notes de porte du lecteur ont appris (moyennes prudentes, sur 10) :
+- Thèmes : ${ligne(appris.themes) || "pas assez de notes"}
+- Types de porte : ${ligne(appris.types) || "pas assez de notes"}
+${appris.mauvaises.length ? `- Portes mal notées (4 ou moins), à ne pas refaire sous le même angle : ${appris.mauvaises.map((t) => `« ${t} »`).join(" ; ")}\n` : ""}Penche vers les thèmes et les types les mieux notés, mais garde une porte sur les trois pour explorer un thème ou un type peu noté ou jamais vu. Les poids de thèmes réglés par le lecteur restent prioritaires : un thème à 0 n'apparaît jamais.`;
+}
+
+/** Le dernier check-in du dimanche (14 jours au plus), en consigne pour la composition. */
+async function consigneCheckin(userId: string | null, jour: string): Promise<string> {
+  if (!userId) return "";
+  const { data } = await admin.from("chevet_checkins").select("semaine, ressenti, raisons")
+    .eq("user_id", userId).gte("semaine", decaler(jour, -14)).order("semaine", { ascending: false }).limit(1).maybeSingle();
+  if (!data) return "";
+  const raisons = (data.raisons ?? []).join(" ; ");
+  const conseil: Record<string, string> = {
+    top: "Continue dans cette veine, sans te répéter.",
+    bof: "Apporte plus de nouveauté et change de ton ou de format sur au moins une porte.",
+    lassant: "Varie nettement les thèmes et les formats, sois plus léger et plus court, évite ce qui a lassé.",
+  };
+  return `Check-in du dimanche (semaine du ${data.semaine}) : le lecteur a trouvé la semaine « ${data.ressenti} »${
+    raisons ? `, parce que : ${raisons}` : ""
+  }. ${conseil[data.ressenti] ?? ""}`;
+}
+
+/**
+ * Score attendu d'une porte : moyenne apprise de son thème et de son type, plus un bonus d'exploration
+ * (type bandit) pour ce qui a été peu noté. Une porte sans historique reçoit la note neutre plus le bonus.
+ */
+function scorePorte(porte: Json, appris: Appris): number {
+  const themes: string[] = (porte.concepts ?? []).map((c: Json) => String(c.theme ?? "")).filter(Boolean);
+  const theme = [...new Set(themes)].sort((a, b) => themes.filter((t) => t === b).length - themes.filter((t) => t === a).length)[0];
+  const part = (liste: Cote[], nom: string | undefined) => {
+    const c = liste.find((x) => x.nom === nom);
+    const n = c?.n ?? 0;
+    const moyenne = c?.moyenne ?? NOTE_NEUTRE;
+    return moyenne + Math.sqrt(Math.log(appris.total + 1) / (n + 1)) * 1.2;
+  };
+  return (part(appris.themes, theme) + part(appris.types, porte.type)) / 2;
+}
+
 async function composer(lot: Json, profil: Json, bonus?: Exclusions) {
   const userId = lot.user_id;
+  const appris = await interetAppris(userId);
+  const semaineRessentie = bonus ? "" : await consigneCheckin(userId, lot.jour);
   const filtreUser = <T extends { is: Json; eq: Json }>(q: T) => (userId ? q.eq("user_id", userId) : q.is("user_id", null));
 
   const { data: anciens } = await filtreUser(
@@ -724,6 +810,8 @@ async function composer(lot: Json, profil: Json, bonus?: Exclusions) {
   const consigne = `${portraitLecteur(profil)}
 
 ${consigneThemes(profil)}
+${consigneInteret(appris)}
+${semaineRessentie}
 ${texteFiche(profil) ? "" : `Centres d'intérêt détaillés : ${JSON.stringify(profil.interets)}`}
 
 Graines (questions posées par le lecteur, pas encore traitées) :
@@ -797,8 +885,14 @@ Format JSON :
     if (porte.type === "reprise" && !repriseAComposer) porte.type = "terrier";
   }
 
+  // Tri par score d'intérêt : les portes les mieux attendues passent d'abord (la reprise garde la tête, voir finaliser).
+  const gardees = portes.filter((p: Json) => p.concepts.length > 0);
+  if (appris && appris.total >= 3) {
+    gardees.sort((x: Json, y: Json) => scorePorte(y, appris) - scorePorte(x, appris));
+  }
+
   return {
-    portes: portes.filter((p: Json) => p.concepts.length > 0),
+    portes: gardees,
     graines: portes.map((p: Json) => p.graine).filter((g: Json) => Number.isInteger(g)),
     teaserDemain: resultat.teaserDemain ?? "",
     curiosites: curiosites.map((c) => c.id),
