@@ -37,6 +37,20 @@ class Soiree(context: Context) {
         get() = prefs.getBoolean("outils_test", false)
         set(v) = prefs.edit().putBoolean("outils_test", v).apply()
 
+    /** L'onboarding s'ouvre tout seul une seule fois ; il reste ensuite dans le menu. */
+    var onboardingProposee: Boolean
+        get() = prefs.getBoolean("onboarding_proposee", false)
+        set(v) = prefs.edit().putBoolean("onboarding_proposee", v).apply()
+
+    var onboardingFait: Boolean
+        get() = prefs.getBoolean("onboarding_fait", false)
+        set(v) = prefs.edit().putBoolean("onboarding_fait", v).apply()
+
+    /** Lundi (AAAA-MM-JJ) de la dernière semaine dont le check-in du dimanche est répondu ou passé. */
+    var checkinSemaine: String
+        get() = prefs.getString("checkin_semaine", null) ?: ""
+        set(v) = prefs.edit().putString("checkin_semaine", v).apply()
+
     // ------------------------------------------------------------ « Trop dense »
 
     /** Note un « trop dense » et renvoie le nombre de ceux des 7 derniers jours. */
