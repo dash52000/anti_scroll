@@ -1,15 +1,18 @@
 // Chevet : appel des modèles de langage avec bascule automatique.
 //
 // Chaque appel déclare un rôle ; chaque rôle a sa chaîne de modèles, essayés dans l'ordre :
-//   redaction    Gemini, puis Groq gpt-oss-120b (composition des portes, rédaction des cartes)
-//   verification Groq gpt-oss-120b, puis Gemini (juge d'une autre famille que le rédacteur, et qui ne
-//                double pas le quota Gemini ; jamais de modèle plus faible : mieux vaut attendre)
-//   leger        Groq gpt-oss-20b, puis Gemini (creuser, notes, pépite, voisins : réponse rapide voulue)
+//   redaction    plusieurs modèles Gemini (3.8-flash, 4-hydrogen, 3-flash-preview), puis Groq
+//                gpt-oss-120b, puis les Gemini de secours (3.7, 3.6, 3.5-flash), puis un flash-lite
+//   verification Groq gpt-oss-120b, puis les Gemini principaux (juge d'une autre famille que le
+//                rédacteur ; jamais de modèle plus faible : mieux vaut attendre)
+//   leger        Groq gpt-oss-20b, puis les flash-lite Gemini, puis deux Gemini principaux
+//                (creuser, notes, pépite, voisins : réponse rapide voulue)
+// Chaque modèle Gemini a son propre quota gratuit : en aligner plusieurs multiplie les essais possibles.
 //
 // Quand basculer :
 //   429             un seul nouvel essai si retry-after ≤ 3 s, sinon modèle suivant et repos du modèle
 //   500/502/503/504 modèle suivant, repos de 2 minutes
-//   délai dépassé   idem (Gemini peut mettre plus de 100 s quand il sature)
+//   délai dépassé   modèle suivant, repos de 4 minutes (Gemini peut mettre plus de 100 s quand il sature)
 //   réponse vide ou JSON inutilisable   modèle suivant, sans repos
 //   401/403/404     modèle suivant, repos de 10 minutes (clé ou nom de modèle à corriger : visible au journal)
 //   autre 4xx       modèle suivant, sans repos
@@ -71,7 +74,13 @@ interface Essai {
 
 const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const MODELE_GEMINI_PAR_DEFAUT = "gemini-3.8-flash";
+// Gemini : un quota gratuit par modèle, donc plusieurs modèles = plusieurs quotas. Testés le 25/11/2026 :
+// 3.8-flash (le mieux écrit, parfois lent), 4-hydrogen, 3-flash-preview répondent ; 3.7, 3.6 et 3.5-flash
+// sont tantôt à court de quota, tantôt en forte demande (503) ; les 3.x-flash-lite répondent vite mais
+// écrivent moins bien (réservés au rôle léger et au dernier recours de la rédaction).
+const GEMINI_PRINCIPAUX = ["gemini-3.8-flash", "gemini-4-hydrogen", "gemini-3-flash-preview"];
+const GEMINI_SECOURS = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"];
+const GEMINI_LEGERS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-flash-lite-latest"];
 const GROQ_120B = "openai/gpt-oss-120b";
 const GROQ_20B = "openai/gpt-oss-20b";
 const BUDGET_PAR_DEFAUT_MS = 135_000;
@@ -91,19 +100,30 @@ function cleDe(f: Fournisseur): string | undefined {
 }
 
 export function chaine(role: Role): Candidat[] {
-  const gemini = (delaiMs: number): Candidat => ({
-    fournisseur: "gemini",
-    modele: lire("CHEVET_GEMINI_MODELE") || MODELE_GEMINI_PAR_DEFAUT,
-    delaiMs,
-  });
+  const gemini = (modele: string, delaiMs: number): Candidat => ({ fournisseur: "gemini", modele, delaiMs });
   const groq = (modele: string, delaiMs: number): Candidat => ({ fournisseur: "groq", modele, delaiMs });
+  // CHEVET_GEMINI_MODELE (secret facultatif) passe un modèle de son choix en tête des modèles Gemini.
+  const choisi = lire("CHEVET_GEMINI_MODELE");
+  const sans = (liste: string[]) => liste.filter((m) => m !== choisi);
+  const principaux = [...(choisi ? [choisi] : []), ...sans(GEMINI_PRINCIPAUX)];
+  const delai = (rang: number) => (rang === 0 ? 70_000 : 45_000);
   switch (role) {
     case "redaction":
-      return [gemini(70_000), groq(GROQ_120B, 60_000)];
+      return [
+        ...principaux.map((m, i) => gemini(m, delai(i))),
+        groq(GROQ_120B, 60_000),
+        ...sans(GEMINI_SECOURS).map((m) => gemini(m, 45_000)),
+        ...GEMINI_LEGERS.slice(0, 1).map((m) => gemini(m, 30_000)),
+      ];
     case "verification":
-      return [groq(GROQ_120B, 60_000), gemini(70_000)];
+      // Jamais de modèle plus faible : seuls les modèles Gemini principaux prennent le relais de Groq.
+      return [groq(GROQ_120B, 60_000), ...principaux.map((m, i) => gemini(m, delai(i)))];
     case "leger":
-      return [groq(GROQ_20B, 30_000), gemini(20_000)];
+      return [
+        groq(GROQ_20B, 30_000),
+        ...GEMINI_LEGERS.map((m) => gemini(m, 20_000)),
+        ...principaux.slice(1, 3).map((m) => gemini(m, 30_000)),
+      ];
   }
 }
 
@@ -319,7 +339,7 @@ export async function appeler(d: DemandeLLM): Promise<ReponseLLM> {
       }
       if (rec.statut === 0 || rec.statut >= 500) {
         noter("indisponible", rec.corps.slice(0, 200));
-        await poserRepos(c, rec.statut === 0 ? 90 : 120, rec.statut, rec.corps);
+        await poserRepos(c, rec.statut === 0 ? 240 : 120, rec.statut, rec.corps);
         break;
       }
       noter("erreur", rec.corps.slice(0, 200));
