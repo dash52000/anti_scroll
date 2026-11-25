@@ -45,11 +45,12 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { appelerJson, LimiteLLM, type Role } from "../_shared/llm.ts";
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const MODELE_REDACTION = "openai/gpt-oss-120b";
-const MODELE_RELECTURE = "openai/gpt-oss-20b";
-const MODELE_VERIFICATION = "openai/gpt-oss-120b";
+// Les modèles se choisissent par rôle, avec bascule automatique Gemini / Groq (voir _shared/llm.ts).
+const MODELE_REDACTION: Role = "redaction";
+const MODELE_RELECTURE: Role = "leger";
+const MODELE_VERIFICATION: Role = "verification";
 const UA = "Chevet/0.1 (https://github.com/dash52000/anti_scroll)";
 const NB_ETAPES = 8;
 const NB_ETAPES_SUITE = 4;
@@ -69,8 +70,6 @@ const CORS = {
 
 // deno-lint-ignore no-explicit-any
 type Json = any;
-
-class LimiteGroq extends Error {}
 
 // ------------------------------------------------------------------ Outils
 
@@ -109,41 +108,14 @@ function melanger<T>(tableau: T[]): T[] {
   return copie;
 }
 
-async function groq(
-  modele: string,
+function ia(
+  role: Role,
   systeme: string,
   utilisateur: string,
   maxTokens = 3000,
   temperature = 0.7,
 ): Promise<Json> {
-  const cle = Deno.env.get("CHEVET_GROQ_API_KEY");
-  if (!cle) throw new Error("Secret CHEVET_GROQ_API_KEY absent");
-  const r = await fetch(GROQ_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${cle}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: modele,
-      messages: [
-        { role: "system", content: systeme },
-        { role: "user", content: utilisateur },
-      ],
-      temperature,
-      max_completion_tokens: maxTokens,
-      reasoning_effort: "low",
-      response_format: { type: "json_object" },
-    }),
-  });
-  if (r.status === 429) throw new LimiteGroq(`Groq limite atteinte, réessayer dans ${r.headers.get("retry-after") ?? "?"} s`);
-  if (!r.ok) throw new Error(`Groq ${r.status} : ${(await r.text()).slice(0, 400)}`);
-  const donnees = await r.json();
-  const texte: string = donnees.choices?.[0]?.message?.content ?? "";
-  try {
-    return JSON.parse(texte);
-  } catch {
-    const bloc = texte.match(/\{[\s\S]*\}/);
-    if (bloc) return JSON.parse(bloc[0]);
-    throw new Error("Réponse Groq non JSON : " + texte.slice(0, 200));
-  }
+  return appelerJson({ role, fonction: "chevet-lot", systeme, utilisateur, maxTokens, temperature });
 }
 
 // ------------------------------------------------------------------ Actu (RSS)
@@ -858,7 +830,7 @@ Format JSON :
 "concepts":[{"titre":"titre court du concept","wikipedia":"Titre exact de l'article français","wikipedia_en":"Exact English article title","theme":"${Object.keys(poidsThemes(profil)).join("|")}"}]}],
 "teaserDemain":"..."}`;
 
-  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 2800);
+  const resultat = await ia(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 2800);
   const portes = (resultat.portes ?? []).slice(0, 3);
   if (portes.length === 0) throw new Error("Composition vide");
 
@@ -1015,7 +987,7 @@ Format JSON :
 "contrePoint":"..." ou null,"pont":"..." ou null,
 "qcm":{"question":"...","choix":["bonne","fausse","fausse"],"autreAngle":"..."},"creuser":["...","...","..."]}]}`;
 
-  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 3600, 0.5);
+  const resultat = await ia(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 3600, 0.5);
   porte.redaction = resultat.concepts ?? [];
 }
 
@@ -1084,7 +1056,7 @@ Réponds dans le même ordre, un objet par concept, une entrée par carte dans l
 "aRetenir":{"verdict":"ok"},"aRaconter":{"verdict":"faux","corrige":"..."},"ordreDeGrandeur":{"preuve":"citation exacte"} ou null,
 "contrePoint":{"verdict":"ok","preuve":"citation exacte"} ou null,"pont":{"verdict":"ok","preuve":"citation exacte"} ou null}]}`;
 
-  const resultat = await groq(MODELE_VERIFICATION, SYSTEME_CHEVET, consigne, 4500, 0.1);
+  const resultat = await ia(MODELE_VERIFICATION, SYSTEME_CHEVET, consigne, 4500, 0.1);
   const verifs: Json[] = Array.isArray(resultat.concepts) ? resultat.concepts : [];
   if (verifs.length !== valides.length) {
     // Sans vérification exploitable, les cartes restent mais aucun extra (contre-point, pont) n'est gardé.
@@ -1202,7 +1174,7 @@ function conceptsRediges(p: Json): Json[] {
 
 async function finaliser(lot: Json, travail: Json) {
   const extraits = (travail.portes ?? []).flatMap((p: Json) => p.concepts.map((c: Json) => `### ${c.titre}\n${c.extrait?.slice(0, 900)}`));
-  const pepite = await groq(
+  const pepite = await ia(
     MODELE_RELECTURE,
     SYSTEME_CHEVET,
     `Dans ces extraits d'articles, choisis le fait le plus renversant, et écris-le en 40 mots au plus,
@@ -1332,7 +1304,7 @@ async function avancer(userId: string | null) {
     travail.tentatives = 0;
   } catch (e) {
     maj.erreur = String(e).slice(0, 500);
-    if (!(e instanceof LimiteGroq)) {
+    if (!(e instanceof LimiteLLM)) {
       travail.tentatives = (travail.tentatives ?? 0) + 1;
       if (travail.tentatives >= 4) maj.statut = "erreur";
     }
@@ -1494,7 +1466,7 @@ Règles :
 Format JSON :
 {"concepts":[{"titre":"titre court du concept","wikipedia":"Titre exact de l'article français","wikipedia_en":"Exact English article title","theme":"${Object.keys(poidsThemes(profil)).join("|")}"}]}`;
 
-  const resultat = await groq(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 1500);
+  const resultat = await ia(MODELE_REDACTION, SYSTEME_CHEVET, consigne, 1500);
   const dejaLa = new Set(gardes.map((c) => c.id));
   const resolus = await Promise.all(
     (resultat.concepts ?? []).slice(0, aEcrire).map(async (c: Json) => ({
@@ -1564,7 +1536,7 @@ async function suite(userId: string, porteId: string, nbGardes: number, demande:
     s.tentatives = 0;
   } catch (e) {
     s.erreur = String(e).slice(0, 500);
-    if (!(e instanceof LimiteGroq)) {
+    if (!(e instanceof LimiteLLM)) {
       s.tentatives = (s.tentatives ?? 0) + 1;
       if (s.tentatives >= 3) s.abandon = true;
     }
@@ -1660,7 +1632,7 @@ async function bonus(userId: string, demande: string, porteId: string | null) {
     b.tentatives = 0;
   } catch (e) {
     b.erreur = String(e).slice(0, 500);
-    if (!(e instanceof LimiteGroq)) {
+    if (!(e instanceof LimiteLLM)) {
       b.tentatives = (b.tentatives ?? 0) + 1;
       if (b.tentatives >= 3) b.abandon = true;
     }
@@ -1705,7 +1677,7 @@ async function voisins(userId: string, url: string, titre: string, slugConcept: 
   const profil = await profilDe(userId);
   let choisis: { titre: string; accroche: string }[] = [];
   try {
-    const r = await groq(
+    const r = await ia(
       MODELE_RELECTURE,
       SYSTEME_CHEVET,
       `${portraitLecteur(profil)}
@@ -1798,7 +1770,7 @@ Format JSON :
 {"plus_loin":{"titre":"...","wikipedia":"Titre exact français","wikipedia_en":"Exact English title","theme":"${Object.keys(poidsThemes(profil)).join("|")}","accroche":"..."},
 "a_cote":{"titre":"...","wikipedia":"...","wikipedia_en":"...","theme":"...","accroche":"..."}}`;
 
-  const resultat = await groq(MODELE_RELECTURE, SYSTEME_CHEVET, consigne, 1200, 0.5);
+  const resultat = await ia(MODELE_RELECTURE, SYSTEME_CHEVET, consigne, 1200, 0.5);
   const profondeur = Math.max(0, Math.floor(Number(depuis.profondeur) || 0)) + 1;
   const concepts: Json[] = [];
   const titres: Json = {};
@@ -1896,7 +1868,7 @@ async function crans(userId: string, corps: Json) {
     travail.tentatives = 0;
   } catch (e) {
     maj.erreur = String(e).slice(0, 500);
-    if (!(e instanceof LimiteGroq)) {
+    if (!(e instanceof LimiteLLM)) {
       travail.tentatives = (travail.tentatives ?? 0) + 1;
       if (travail.tentatives >= 3 || String(e).includes("Aucune suite")) maj.statut = "erreur";
     }

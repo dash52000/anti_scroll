@@ -1,7 +1,7 @@
 // Chevet : notes perso. Deux actions, avec le JWT de l'utilisateur.
 //
 //   {"action":"repondre","note_id":"..."}
-//       « Réponds-moi » : une réponse tout de suite, gpt-oss-20b, 120 mots au plus. Elle s'écrit dans la
+//       « Réponds-moi » : une réponse tout de suite, rôle « léger », 120 mots au plus. Elle s'écrit dans la
 //       note et y reste. Quota à part de « creuser » : 3 réponses par tranche de 24 h.
 //       Réponse : {"reponse":"...","restants":2,"parJour":3} ou {"quota":true,"restants":0,"parJour":3}
 //   {"action":"revient"}
@@ -11,9 +11,8 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { appelerJson, appelerTexte, LimiteLLM } from "../_shared/llm.ts";
 
-const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const MODELE = "openai/gpt-oss-20b";
 const REPONSES_PAR_JOUR = 3;
 const JOUR_MS = 86_400_000;
 
@@ -31,8 +30,6 @@ const CORS = {
 // deno-lint-ignore no-explicit-any
 type Json = any;
 
-class LimiteGroq extends Error {}
-
 function reponse(corps: unknown, statut = 200): Response {
   return new Response(JSON.stringify(corps), {
     status: statut,
@@ -44,27 +41,10 @@ function jourParis(): string {
   return new Intl.DateTimeFormat("fr-CA", { timeZone: "Europe/Paris" }).format(new Date());
 }
 
-async function groq(systeme: string, utilisateur: string, maxTokens: number, json: boolean): Promise<string> {
-  const cle = Deno.env.get("CHEVET_GROQ_API_KEY");
-  if (!cle) throw new Error("Secret CHEVET_GROQ_API_KEY absent");
-  const r = await fetch(GROQ_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${cle}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: MODELE,
-      temperature: json ? 0.2 : 0.6,
-      max_completion_tokens: maxTokens,
-      reasoning_effort: "low",
-      ...(json ? { response_format: { type: "json_object" } } : {}),
-      messages: [
-        { role: "system", content: systeme },
-        { role: "user", content: utilisateur },
-      ],
-    }),
-  });
-  if (r.status === 429) throw new LimiteGroq("Groq est saturé, réessaie dans une minute.");
-  if (!r.ok) throw new Error(`Groq ${r.status} : ${(await r.text()).slice(0, 300)}`);
-  return String((await r.json()).choices?.[0]?.message?.content ?? "");
+// Rôle « léger » : gpt-oss-20b, puis Gemini si Groq sature (voir _shared/llm.ts).
+async function ia(systeme: string, utilisateur: string, maxTokens: number, json: boolean): Promise<string> {
+  const demande = { role: "leger" as const, fonction: "chevet-notes", systeme, utilisateur, maxTokens, temperature: json ? 0.2 : 0.6 };
+  return json ? JSON.stringify(await appelerJson(demande)) : await appelerTexte(demande);
 }
 
 // ------------------------------------------------------------------ Réponds-moi
@@ -88,7 +68,7 @@ async function repondre(userId: string, noteId: string) {
   const styleFiche = fiche.find((r) => r.titre === "Style attendu")?.puces ?? [];
   const style = styleFiche.length ? styleFiche.join(" ; ") : JSON.stringify(profil?.style ?? {});
 
-  const texte = (await groq(
+  const texte = (await ia(
     "Tu es le conteur de Chevet, une appli de petites leçons du soir. Le lecteur t'écrit une note : une idée, " +
       "une réflexion ou une question à lui. Réponds-lui en français, en tutoyant, en 120 mots au plus. " +
       "Commence par prolonger son idée, puis, si elle en vaut la peine, donne la meilleure objection ou nuance qu'on lui ferait. " +
@@ -142,7 +122,7 @@ async function revient(userId: string) {
   const concepts: Json[] = lus ?? [];
   if (concepts.length === 0) return { note: null };
 
-  const choix = JSON.parse(await groq(
+  const choix = JSON.parse(await ia(
     "Tu relies des notes personnelles à des concepts lus depuis. Tu ne retiens un lien que s'il est net : " +
       "le concept éclaire, prolonge ou contredit l'idée de la note. Dans le doute, tu ne retiens rien.",
     `Notes (identifiant, date, texte) :
@@ -190,7 +170,7 @@ Deno.serve(async (req) => {
         return reponse({ erreur: `Action inconnue : ${corps.action}` }, 400);
     }
   } catch (e) {
-    if (e instanceof LimiteGroq) return reponse({ erreur: e.message }, 503);
+    if (e instanceof LimiteLLM) return reponse({ erreur: "Les modèles sont saturés, réessaie dans une minute." }, 503);
     return reponse({ erreur: String(e) }, 500);
   }
 });

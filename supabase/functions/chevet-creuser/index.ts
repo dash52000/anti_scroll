@@ -1,4 +1,4 @@
-// Chevet : bouton « creuser ». Répond à une question sur une carte avec gpt-oss-20b.
+// Chevet : bouton « creuser ». Répond à une question sur une carte (rôle « léger » : gpt-oss-20b, puis Gemini si Groq sature).
 // Quota : réglable de 1 à 10 réponses par soir (3 par défaut), vérifié ici côté serveur.
 //
 // POST JSON, avec le JWT de l'utilisateur :
@@ -7,6 +7,7 @@
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { appelerTexte, LimiteLLM } from "../_shared/llm.ts";
 
 const QUOTA_PAR_DEFAUT = 3;
 
@@ -58,35 +59,26 @@ Deno.serve(async (req) => {
     const styleFiche = fiche.find((r) => r.titre === "Style attendu")?.puces ?? [];
     const style = styleFiche.length ? styleFiche.join(" ; ") : JSON.stringify(profil?.style ?? {});
 
-    const cle = Deno.env.get("CHEVET_GROQ_API_KEY");
-    if (!cle) throw new Error("Secret CHEVET_GROQ_API_KEY absent");
-    const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${cle}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "openai/gpt-oss-20b",
+    let texte: string;
+    try {
+      texte = await appelerTexte({
+        role: "leger",
+        fonction: "chevet-creuser",
+        maxTokens: 900,
         temperature: 0.6,
-        max_completion_tokens: 900,
-        reasoning_effort: "low",
-        messages: [
-          {
-            role: "system",
-            content:
-              "Tu es le conteur de Chevet, une appli de petites leçons du soir. Le lecteur est au lit, fatigué. " +
-              "Réponds en français, en 90 mots au plus, de façon concrète, avec une anecdote si possible, sans jargon ni morale. " +
-              "Si tu n'es pas sûr d'un fait, dis-le simplement plutôt que d'inventer. " +
-              `Niveaux du lecteur : ${JSON.stringify(profil?.niveaux ?? {})}. Style : ${style}.`,
-          },
-          {
-            role: "user",
-            content: `Concept : ${concept}\nCe que la carte disait : ${contexte}\nSource : ${source}\n\nQuestion : ${question}`,
-          },
-        ],
-      }),
-    });
-    if (r.status === 429) return reponse({ erreur: "Groq est saturé, réessaie dans une minute.", restants: QUOTA - dejaFaits }, 503);
-    if (!r.ok) throw new Error(`Groq ${r.status} : ${(await r.text()).slice(0, 300)}`);
-    const texte: string = (await r.json()).choices?.[0]?.message?.content ?? "";
+        systeme:
+          "Tu es le conteur de Chevet, une appli de petites leçons du soir. Le lecteur est au lit, fatigué. " +
+          "Réponds en français, en 90 mots au plus, de façon concrète, avec une anecdote si possible, sans jargon ni morale. " +
+          "Si tu n'es pas sûr d'un fait, dis-le simplement plutôt que d'inventer. " +
+          `Niveaux du lecteur : ${JSON.stringify(profil?.niveaux ?? {})}. Style : ${style}.`,
+        utilisateur: `Concept : ${concept}\nCe que la carte disait : ${contexte}\nSource : ${source}\n\nQuestion : ${question}`,
+      });
+    } catch (e) {
+      if (e instanceof LimiteLLM) {
+        return reponse({ erreur: "Les modèles sont saturés, réessaie dans une minute.", restants: QUOTA - dejaFaits }, 503);
+      }
+      throw e;
+    }
 
     await admin.from("chevet_journal").insert({
       user_id: userId,
